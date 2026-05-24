@@ -46,7 +46,7 @@ sudo apt install nmap iproute2 iptables avahi-utils samba-common-bin ipcalc dnsu
 ## Installation
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/netwatch.git
+https://github.com/Patrickk2/NETWATCH-carbone..git
 cd netwatch
 chmod +x netwatch.sh
 sudo ./netwatch.sh          # launch interactive menu
