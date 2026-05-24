@@ -1,0 +1,10 @@
+# netwatch runtime data (don't commit personal network logs)
+.config/
+*.log
+*.tmp
+export_*.csv
+export_*.json
+
+# OS clutter
+.DS_Store
+Thumbs.db
