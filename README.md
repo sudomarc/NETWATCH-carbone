@@ -164,3 +164,7 @@ MIT — see [LICENSE](LICENSE)
 ## Contributing
 
 PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+
+## Built with
+
+Vibe coded with [Claude](https://claude.ai) by Anthropic.
