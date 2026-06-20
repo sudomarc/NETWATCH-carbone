@@ -95,6 +95,35 @@ Config/logs: `%USERPROFILE%\.netwatch\` (override with `NETWATCH_CONFIG`).
 
 ---
 
+## Android (Termux, no root)
+
+`netwatch-android.sh` runs in [Termux](https://termux.dev) on a stock,
+non-rooted phone. It covers **scan**, **identify**, **monitor**, **export**
+only — `block`/`throttle`/`unblock`/`unthrottle`/`reset` are disabled because
+they need `iptables`/`tc`, which require root.
+
+```bash
+pkg install nmap iproute2 dnsutils curl
+git clone https://github.com/Patrickk2/NETWATCH-carbone..git
+cd NETWATCH-carbone.
+chmod +x netwatch-android.sh
+./netwatch-android.sh
+```
+
+Notes:
+- Host discovery uses `nmap -sn --unprivileged` (ICMP/connect-based — no raw
+  ARP scan without root, but MAC addresses still show up via `ip neigh`
+  reading the kernel's own ARP cache after a successful ping).
+- `identify`'s port scan runs `nmap -sV --unprivileged` (connect scan, no
+  `-O` OS detection — that needs raw sockets/root).
+- No mDNS/NetBIOS lookup (no Termux packages for `avahi-browse`/`nmblookup`).
+- If you root the phone later, use `netwatch.sh` (the Linux version) instead
+  for full block/throttle parity.
+
+Config/logs: `$HOME/.netwatch/` (override with `NETWATCH_CONFIG`).
+
+---
+
 ## Usage
 
 ```
