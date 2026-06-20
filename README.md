@@ -60,6 +60,41 @@ sudo netwatch
 
 ---
 
+## Windows
+
+A PowerShell port, `netwatch.ps1`, ships in this repo with the same CLI and
+interactive menu (`scan`, `monitor`, `identify`, `block`, `unblock`,
+`throttle`, `unthrottle`, `list`, `export`, `reset`, `help`).
+
+```powershell
+git clone https://github.com/Patrickk2/NETWATCH-carbone..git
+cd NETWATCH-carbone.
+Set-ExecutionPolicy -Scope Process Bypass -Force   # allow this script to run
+.\netwatch.ps1                                      # launch interactive menu (Admin recommended)
+```
+
+Requirements: Windows 8 / Server 2012+ (NetTCPIP module, built-in). `nmap`
+(`winget install Insecure.Nmap`) is optional but recommended for faster
+scans + OS fingerprinting in `identify` — without it the script falls back
+to a native ping sweep and a common-port TCP connect scan.
+
+**How blocking/throttling differ from Linux:**
+
+| | Linux (`netwatch.sh`) | Windows (`netwatch.ps1`) |
+|---|---|---|
+| Block | `iptables` FORWARD rules (router mode) + optional ARP spoof kick | Windows Firewall rule — blocks **this machine's** traffic to/from the target |
+| Throttle | `tc`/`htb` on the gateway interface | `New-NetQosPolicy` |
+| LAN-wide kick (non-gateway client) | `arpspoof` (optional dep) | **Not implemented** — needs Npcap + a packet-injection tool, no native Windows equivalent |
+
+Same rule as Linux applies: full network-wide block/throttle of *another*
+device only works when the machine running netwatch **is** the
+gateway/router (e.g. Windows ICS host). On a regular client PC, `block`
+only protects that PC itself.
+
+Config/logs: `%USERPROFILE%\.netwatch\` (override with `NETWATCH_CONFIG`).
+
+---
+
 ## Usage
 
 ```
