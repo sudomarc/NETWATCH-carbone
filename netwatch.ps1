@@ -15,7 +15,7 @@
 
 # ─── State ─────────────────────────────────────────────────────────────────
 
-$Script:ConfigDir    = if ($env:NETWATCH_CONFIG) { $env:NETWATCH_CONFIG } else { Join-Path $env:USERPROFILE ".netwatch" }
+$Script:ConfigDir    = if ($env:NETWATCH_CONFIG) { $env:NETWATCH_CONFIG } else { Join-Path $HOME ".netwatch" }
 $Script:BlockFile    = Join-Path $Script:ConfigDir "blocked_macs.txt"
 $Script:BlockedIps   = Join-Path $Script:ConfigDir "blocked_ips.txt"
 $Script:ThrottleFile = Join-Path $Script:ConfigDir "throttled_macs.txt"
@@ -69,6 +69,7 @@ function Normalize-Mac   { param([string]$Mac)   return $Mac.ToUpper() }
 
 function Get-VendorFromMac {
     param([string]$Mac)
+    if (-not $Mac -or $Mac.Length -lt 8) { return "Unknown" }
     $oui = $Mac.ToUpper().Substring(0, 8)
     switch -Regex ($oui) {
         '^(00:1A:2B|00:50:56|00:0C:29|00:05:69)$'             { return "VMware" }
@@ -107,8 +108,27 @@ function Detect-Network {
         Where-Object { $_.IPAddress -notlike "169.254.*" } | Select-Object -First 1
     if (-not $ipcfg) { Die "No local IP on interface $($Script:IfaceAlias)." }
 
-    $octets = $ipcfg.IPAddress.Split('.')
-    $Script:Subnet = "$($octets[0]).$($octets[1]).$($octets[2]).0/24"
+    # Compute subnet address dynamically based on IP and PrefixLength
+    $ipBytes = [System.Net.IPAddress]::Parse($ipcfg.IPAddress).GetAddressBytes()
+    $maskBytes = New-Object byte[] 4
+    $pl = $ipcfg.PrefixLength
+    for ($i = 0; $i -lt 4; $i++) {
+        if ($pl -ge 8) {
+            $maskBytes[$i] = 255
+            $pl -= 8
+        } elseif ($pl -gt 0) {
+            $maskBytes[$i] = [byte](256 - [Math]::Pow(2, 8 - $pl))
+            $pl = 0
+        } else {
+            $maskBytes[$i] = 0
+        }
+    }
+    $netBytes = New-Object byte[] 4
+    for ($i = 0; $i -lt 4; $i++) {
+        $netBytes[$i] = $ipBytes[$i] -band $maskBytes[$i]
+    }
+    $subnetIp = $netBytes -join "."
+    $Script:Subnet = "$subnetIp/$($ipcfg.PrefixLength)"
 
     Info "Interface: $($Script:IfaceAlias) | Subnet: $($Script:Subnet) | Gateway: $($Script:Gateway)"
 }
@@ -117,19 +137,31 @@ function Detect-Network {
 
 function Resolve-IpMac {
     param([string]$Target)
+    if ($null -eq $Script:IfIndex) { Detect-Network }
     $ip = $null
     $mac = $null
     if (Test-ValidMac $Target) {
         $mac = Normalize-Mac $Target
-        $neigh = Get-NetNeighbor -ErrorAction SilentlyContinue |
+        $neigh = Get-NetNeighbor -InterfaceIndex $Script:IfIndex -ErrorAction SilentlyContinue |
             Where-Object { ($_.LinkLayerAddress -replace '-', ':').ToUpper() -eq $mac } |
             Select-Object -First 1
         if ($neigh) { $ip = $neigh.IPAddress }
     } else {
         $ip = $Target
-        $neigh = Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue | Select-Object -First 1
+        $neigh = Get-NetNeighbor -IPAddress $ip -InterfaceIndex $Script:IfIndex -ErrorAction SilentlyContinue | Select-Object -First 1
         if ($neigh -and $neigh.LinkLayerAddress -and $neigh.LinkLayerAddress -ne "00-00-00-00-00-00") {
             $mac = Normalize-Mac ($neigh.LinkLayerAddress -replace '-', ':')
+        }
+        if (-not $mac) {
+            # Try to ping target to populate ARP cache/neighbor table
+            try {
+                $ping = New-Object System.Net.NetworkInformation.Ping
+                $ping.Send($ip, 200) | Out-Null
+            } catch {}
+            $neigh = Get-NetNeighbor -IPAddress $ip -InterfaceIndex $Script:IfIndex -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($neigh -and $neigh.LinkLayerAddress -and $neigh.LinkLayerAddress -ne "00-00-00-00-00-00") {
+                $mac = Normalize-Mac ($neigh.LinkLayerAddress -replace '-', ':')
+            }
         }
     }
     return [PSCustomObject]@{ IP = $ip; MAC = $mac }
@@ -149,8 +181,8 @@ function Show-DeviceTable {
         $color = "Gray"
         if ($d.Blocked -eq "BLOCKED") { $color = "Red" }
         elseif ($d.Throttled -ne "-") { $color = "Yellow" }
-        $h = $d.Hostname; if ($h.Length -gt 20) { $h = $h.Substring(0, 20) }
-        $v = $d.Vendor;   if ($v.Length -gt 12) { $v = $v.Substring(0, 12) }
+        $h = $d.Hostname; if (-not $h) { $h = "-" } elseif ($h.Length -gt 20) { $h = $h.Substring(0, 20) }
+        $v = $d.Vendor;   if (-not $v) { $v = "-" } elseif ($v.Length -gt 12) { $v = $v.Substring(0, 12) }
         Write-Host ($fmt -f $i, $d.IP, $d.MAC, $h, $v, $d.Blocked, $d.Throttled) -ForegroundColor $color
         $i++
     }
@@ -191,7 +223,7 @@ function Invoke-Scan {
     foreach ($ip in $upHosts) {
         if ($ip -eq $Script:Gateway) { continue }
 
-        $neigh = Get-NetNeighbor -IPAddress $ip -ErrorAction SilentlyContinue | Select-Object -First 1
+        $neigh = Get-NetNeighbor -IPAddress $ip -InterfaceIndex $Script:IfIndex -ErrorAction SilentlyContinue | Select-Object -First 1
         $mac = "--"
         if ($neigh -and $neigh.LinkLayerAddress -and $neigh.LinkLayerAddress -ne "00-00-00-00-00-00") {
             $mac = Normalize-Mac ($neigh.LinkLayerAddress -replace '-', ':')
@@ -288,7 +320,11 @@ function Invoke-Block {
         if (Test-Path $Script:BlockFile) { $existing = Get-Content $Script:BlockFile }
         if ($existing -notcontains $mac) { Add-Content -Path $Script:BlockFile -Value $mac }
     }
-    Add-Content -Path $Script:BlockedIps -Value $ip
+    if ($ip) {
+        $existingIps = @()
+        if (Test-Path $Script:BlockedIps) { $existingIps = Get-Content $Script:BlockedIps }
+        if ($existingIps -notcontains $ip) { Add-Content -Path $Script:BlockedIps -Value $ip }
+    }
 
     $macSuffix = ""
     if ($mac) { $macSuffix = " ($mac)" }
@@ -481,7 +517,7 @@ function Invoke-Identify {
 
     Write-Host "`n[2/5] Hardware Vendor" -ForegroundColor White
     $vendor = ""
-    if ($mac) {
+    if ($mac -and $mac.Length -ge 8) {
         $oui = $mac.Substring(0, 8)
         try {
             $vendor = Invoke-RestMethod -Uri "https://api.macvendors.com/$oui" -TimeoutSec 3 -ErrorAction Stop
@@ -540,7 +576,7 @@ function Invoke-Reset {
     Require-Admin
     Warn "This will remove all netwatch firewall rules and QoS policies. Continue? [y/N]"
     $yn = Read-Host
-    if ($yn.ToLower() -ne "y") { Info "Aborted."; return }
+    if (-not $yn -or $yn.ToLower() -ne "y") { Info "Aborted."; return }
 
     Info "Resetting all rules ..."
     Get-NetFirewallRule -ErrorAction SilentlyContinue |
@@ -615,6 +651,7 @@ function Invoke-Menu {
         Write-Host "  [Q] Quit"
         Write-Host ""
         $choice = Read-Host "  Choice"
+        if (-not $choice) { continue }
 
         switch ($choice.ToLower()) {
             "1" {
@@ -639,7 +676,7 @@ function Invoke-Menu {
                 if ($d) {
                     $target = $d.IP; if ($d.MAC -ne "--") { $target = $d.MAC }
                     $yn = Read-Host "Block $($d.IP) ($target)? [y/N]"
-                    if ($yn.ToLower() -eq "y") {
+                    if ($yn -and $yn.ToLower() -eq "y") {
                         Invoke-Block $target
                         $Devices = Invoke-Scan -Format "raw_objects"
                     }
@@ -688,7 +725,12 @@ function Invoke-Menu {
             "8" {
                 $interval = Read-Host "  Refresh interval in seconds [30]"
                 if (-not $interval) { $interval = 30 }
-                Invoke-Monitor -Interval ([int]$interval)
+                if ($interval -match '^[0-9]+$') {
+                    Invoke-Monitor -Interval ([int]$interval)
+                } else {
+                    Warn "Interval must be a positive integer."
+                    Start-Sleep -Seconds 1
+                }
             }
             "9" {
                 Write-Host "  [1] CSV   [2] JSON"
@@ -776,8 +818,7 @@ foreach ($a in $args) {
 
 $Cmd = "menu"
 if ($filteredArgs.Count -ge 1) { $Cmd = $filteredArgs[0] }
-$rest = @()
-if ($filteredArgs.Count -ge 2) { $rest = $filteredArgs[1..($filteredArgs.Count - 1)] }
+$rest = @($filteredArgs | Select-Object -Skip 1)
 
 switch ($Cmd) {
     "menu" {
