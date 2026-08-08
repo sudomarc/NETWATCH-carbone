@@ -15,6 +15,8 @@
 
 # ─── State ─────────────────────────────────────────────────────────────────
 
+$Script:Version      = "1.2"
+$Script:UpdateUrl    = "https://raw.githubusercontent.com/sudomarc/NETWATCH-carbone/main/netwatch.ps1"
 $Script:ConfigDir    = if ($env:NETWATCH_CONFIG) { $env:NETWATCH_CONFIG } else { Join-Path $HOME ".netwatch" }
 $Script:BlockFile    = Join-Path $Script:ConfigDir "blocked_macs.txt"
 $Script:BlockedIps   = Join-Path $Script:ConfigDir "blocked_ips.txt"
@@ -60,6 +62,158 @@ function Check-Deps {
     }
     if (-not (Get-Command nmap.exe -ErrorAction SilentlyContinue)) {
         Warn "nmap not found - using native ping sweep (slower, no OS fingerprint). Install: winget install Insecure.Nmap"
+    }
+}
+
+# ─── Automatic Updates ─────────────────────────────────────────────────────
+
+function Invoke-CheckUpdate {
+    param([bool]$Silent = $false)
+
+    New-Item -ItemType Directory -Force -Path $Script:ConfigDir | Out-Null
+
+    $lastCheckFile = Join-Path $Script:ConfigDir ".last_update_check"
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    Set-Content -Path $lastCheckFile -Value $now -ErrorAction SilentlyContinue
+
+    $remoteVersion = $null
+    try {
+        if ($Silent) {
+            $response = Invoke-RestMethod -Uri $Script:UpdateUrl -TimeoutSec 3 -ErrorAction Stop
+        } else {
+            Info "Checking for updates..."
+            $response = Invoke-RestMethod -Uri $Script:UpdateUrl -TimeoutSec 8 -ErrorAction Stop
+        }
+
+        if ($response -match '\$Script:Version\s*=\s*"([^"]+)"') {
+            $remoteVersion = $Matches[1]
+        }
+    } catch {
+        if (-not $Silent) { Err "Failed to check for updates: $($_.Exception.Message)" }
+        return $false
+    }
+
+    if (-not $remoteVersion) {
+        if (-not $Silent) { Err "Failed to parse remote version information." }
+        return $false
+    }
+
+    try {
+        if ([version]$remoteVersion -gt [version]$Script:Version) {
+            if ($Silent) {
+                Write-Host ""
+                Write-Host "[!] A new version of netwatch is available: v$remoteVersion (current: v$($Script:Version))" -ForegroundColor Yellow
+                Write-Host "[!] Run '.\netwatch.ps1 update' or select 'U' in the menu to update." -ForegroundColor Yellow
+                Write-Host ""
+            } else {
+                Ok "A new version of netwatch is available: v$remoteVersion (current: v$($Script:Version))"
+            }
+            return $true
+        } else {
+            if (-not $Silent) { Ok "netwatch is up-to-date (v$($Script:Version))." }
+            return $false
+        }
+    } catch {
+        if (-not $Silent) { Err "Error comparing version numbers." }
+        return $false
+    }
+}
+
+function Invoke-ApplyUpdate {
+    $updateAvailable = Invoke-CheckUpdate -Silent $false
+    if (-not $updateAvailable) {
+        return
+    }
+
+    try {
+        $response = Invoke-RestMethod -Uri $Script:UpdateUrl -TimeoutSec 10 -ErrorAction Stop
+        if ($response -match '\$Script:Version\s*=\s*"([^"]+)"') {
+            $remoteVersion = $Matches[1]
+        }
+    } catch {
+        Die "Failed to fetch update script."
+    }
+
+    if (-not $remoteVersion) {
+        Die "Failed to parse remote version."
+    }
+
+    $scriptPath = $MyInvocation.MyCommand.Path
+    if (-not $scriptPath) {
+        $scriptPath = Join-Path $pwd "netwatch.ps1"
+    }
+
+    try {
+        $testFileStream = [System.IO.File]::OpenWrite($scriptPath)
+        $testFileStream.Close()
+    } catch {
+        Err "No write permissions to update '$scriptPath'."
+        Err "Please run PowerShell as Administrator to update."
+        return
+    }
+
+    Info "Downloading netwatch v$remoteVersion..."
+    $tmpFile = [System.IO.Path]::GetTempFileName()
+    try {
+        Invoke-WebRequest -Uri $Script:UpdateUrl -OutFile $tmpFile -TimeoutSec 15 -ErrorAction Stop
+    } catch {
+        if (Test-Path $tmpFile) { Remove-Item $tmpFile -Force }
+        Die "Failed to download update script."
+    }
+
+    $content = Get-Content $tmpFile -Raw
+    if ($content -notmatch '\$Script:Version\s*=') {
+        Remove-Item $tmpFile -Force
+        Die "Downloaded file is invalid (missing version definition)."
+    }
+
+    $backupPath = $scriptPath + ".bak"
+    Info "Backing up current script to $backupPath..."
+    try {
+        Copy-Item -Path $scriptPath -Destination $backupPath -Force -ErrorAction Stop
+    } catch {
+        Remove-Item $tmpFile -Force
+        Die "Failed to create backup: $($_.Exception.Message)"
+    }
+
+    Info "Applying update..."
+    try {
+        Move-Item -Path $tmpFile -Destination $scriptPath -Force -ErrorAction Stop
+        Ok "Successfully updated netwatch to v$remoteVersion!"
+        if (Test-Path $backupPath) { Remove-Item $backupPath -Force }
+    } catch {
+        if (Test-Path $backupPath) {
+            Copy-Item -Path $backupPath -Destination $scriptPath -Force
+            Remove-Item $backupPath -Force
+        }
+        Die "Failed to apply update. Restored backup."
+    }
+
+    Info "Restarting netwatch..."
+    if ($host.Name -eq 'ConsoleHost') {
+        $engine = if ($PSVersionTable.PSEdition -eq 'Core') { "pwsh" } else { "powershell" }
+        Start-Process $engine -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+        exit
+    } else {
+        & $scriptPath
+        exit
+    }
+}
+
+function Invoke-AutoCheckUpdate {
+    $lastCheckFile = Join-Path $Script:ConfigDir ".last_update_check"
+    $lastCheck = 0
+    if (Test-Path $lastCheckFile) {
+        $content = Get-Content $lastCheckFile -Raw -ErrorAction SilentlyContinue
+        if ($content -match '^\d+$') {
+            $lastCheck = [int64]$content
+        }
+    }
+
+    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    if ($now - $lastCheck -gt 86400) {
+        Set-Content -Path $lastCheckFile -Value $now -ErrorAction SilentlyContinue
+        Invoke-CheckUpdate -Silent $true
     }
 }
 
@@ -630,6 +784,7 @@ function Select-Device {
 function Invoke-Menu {
     Check-Deps
     Detect-Network
+    Invoke-AutoCheckUpdate
     Info "Running initial scan..."
     $Devices = Invoke-Scan -Format "raw_objects"
 
@@ -648,6 +803,7 @@ function Invoke-Menu {
         Write-Host "  [9] Export scan"
         Write-Host "  [L] List blocked/throttled"
         Write-Host "  [R] Reset all rules"
+        Write-Host "  [U] Check for updates / Update"
         Write-Host "  [Q] Quit"
         Write-Host ""
         $choice = Read-Host "  Choice"
@@ -748,6 +904,10 @@ function Invoke-Menu {
                 $Devices = Invoke-Scan -Format "raw_objects"
                 Read-Host "Press Enter to continue" | Out-Null
             }
+            "u" {
+                Invoke-ApplyUpdate
+                Read-Host "Press Enter to continue" | Out-Null
+            }
             "q" {
                 Write-Host "`nGoodbye!`n" -ForegroundColor Green
                 exit 0
@@ -781,6 +941,7 @@ Commands:
   list                        Show blocked/throttled MACs
   export [csv|json]           Export scan to $($Script:ConfigDir)
   reset                       Clear all firewall/QoS rules
+  update                      Check and apply automatic updates
   help                        Show this help
 
 Flags:
@@ -823,6 +984,9 @@ $rest = @($filteredArgs | Select-Object -Skip 1)
 switch ($Cmd) {
     "menu" {
         Invoke-Menu
+    }
+    "update" {
+        Invoke-ApplyUpdate
     }
     "scan" {
         Check-Deps; Detect-Network
