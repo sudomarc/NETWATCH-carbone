@@ -5,6 +5,8 @@
 # Scan + identify only. Block/throttle/reset need root (iptables/tc) —
 # not available on stock Android. See README "Android (Termux)" section.
 
+VERSION="1.2"
+UPDATE_URL="https://raw.githubusercontent.com/sudomarc/NETWATCH-carbone/main/netwatch-android.sh"
 SCRIPT_NAME=$(basename "$0")
 CONFIG_DIR="${NETWATCH_CONFIG:-$HOME/.netwatch}"
 BLOCK_FILE="$CONFIG_DIR/blocked_macs"
@@ -23,6 +25,24 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
+
+version_gt() {
+    # Compare semver or standard version strings
+    local ip1 ip2
+    IFS='.' read -r -a ip1 <<< "$1"
+    IFS='.' read -r -a ip2 <<< "$2"
+    # Pad to equal length
+    for ((i=${#ip1[@]}; i<3; i++)); do ip1[i]=0; done
+    for ((i=${#ip2[@]}; i<3; i++)); do ip2[i]=0; done
+    for ((i=0; i<3; i++)); do
+        if ((10#${ip1[i]} > 10#${ip2[i]})); then
+            return 0
+        elif ((10#${ip1[i]} < 10#${ip2[i]})); then
+            return 1
+        fi
+    done
+    return 1
+}
 
 log()     { mkdir -p "$CONFIG_DIR"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$SCAN_LOG"; }
 info()    { echo -e "${BLUE}[•]${NC} $*"; }
@@ -47,6 +67,131 @@ check_deps() {
     fi
     command -v curl &>/dev/null || warn "curl not found (optional, used for online vendor lookup). pkg install curl"
     command -v dig  &>/dev/null || warn "dig not found (optional, used for rDNS). pkg install dnsutils"
+}
+
+# ─── Automatic Updates ────────────────────────────────────────────────────────
+
+check_update() {
+    local silent="${1:-false}"
+
+    mkdir -p "$CONFIG_DIR"
+
+    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
+        $silent || err "Neither curl nor wget is installed. Cannot check for updates."
+        return 1
+    fi
+
+    local remote_version=""
+    if $silent; then
+        if command -v curl &>/dev/null; then
+            remote_version=$(curl -sSL --max-time 3 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
+        else
+            remote_version=$(wget -qO- --timeout=3 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
+        fi
+    else
+        info "Checking for updates..."
+        if command -v curl &>/dev/null; then
+            remote_version=$(curl -sSL --max-time 8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
+        else
+            remote_version=$(wget -qO- --timeout=8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
+        fi
+    fi
+
+    if [[ -z "$remote_version" ]]; then
+        $silent || err "Failed to fetch remote version information."
+        return 1
+    fi
+
+    if version_gt "$remote_version" "$VERSION"; then
+        if $silent; then
+            echo -e "\n${YELLOW}[!] A new version of netwatch is available: v$remote_version (current: v$VERSION)${NC}"
+            echo -e "${YELLOW}[!] Run '$SCRIPT_NAME update' or select 'U' in the menu to update.${NC}\n"
+        else
+            ok "A new version of netwatch is available: v$remote_version (current: v$VERSION)"
+            return 0
+        fi
+    else
+        $silent || ok "netwatch is up-to-date (v$VERSION)."
+        return 1
+    fi
+}
+
+apply_update() {
+    # Check if update is available
+    if ! check_update false; then
+        return 0
+    fi
+
+    local remote_version=""
+    if command -v curl &>/dev/null; then
+        remote_version=$(curl -sSL --max-time 8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
+    else
+        remote_version=$(wget -qO- --timeout=8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
+    fi
+
+    [[ -z "$remote_version" ]] && die "Error fetching remote version."
+
+    local tmp_file
+    tmp_file=$(mktemp "${TMPDIR:-/tmp}/netwatch_update_XXXXXX.sh")
+
+    info "Downloading netwatch v$remote_version..."
+    if command -v curl &>/dev/null; then
+        curl -sSL --max-time 15 -o "$tmp_file" "$UPDATE_URL"
+    else
+        wget -qO "$tmp_file" --timeout=15 "$UPDATE_URL"
+    fi
+
+    if [[ ! -s "$tmp_file" ]]; then
+        rm -f "$tmp_file"
+        die "Download failed or empty file."
+    fi
+
+    if ! grep -q "^#!/bin/bash" "$tmp_file"; then
+        rm -f "$tmp_file"
+        die "Downloaded file is invalid (missing shebang)."
+    fi
+
+    local target_script="$0"
+    local real_script
+    real_script=$(readlink -f "$target_script" 2>/dev/null || realpath "$target_script" 2>/dev/null || echo "$target_script")
+
+    if [[ ! -w "$real_script" ]]; then
+        err "No write permissions to update '$real_script'."
+        err "Please run with sudo: sudo $SCRIPT_NAME update"
+        rm -f "$tmp_file"
+        return 1
+    fi
+
+    info "Backing up current script to ${real_script}.bak..."
+    cp "$real_script" "${real_script}.bak" || die "Failed to create backup."
+
+    info "Applying update..."
+    mv "$tmp_file" "$real_script" || {
+        mv "${real_script}.bak" "$real_script"
+        die "Failed to replace the script file. Restored backup."
+    }
+
+    chmod +x "$real_script"
+    ok "Successfully updated netwatch to v$remote_version!"
+    rm -f "${real_script}.bak"
+
+    info "Restarting netwatch..."
+    exec "$real_script" "$@"
+}
+
+auto_check_update() {
+    local last_check=0
+    if [[ -f "$CONFIG_DIR/.last_update_check" ]]; then
+        last_check=$(cat "$CONFIG_DIR/.last_update_check" 2>/dev/null || echo 0)
+    fi
+
+    local now
+    now=$(date +%s 2>/dev/null || echo 0)
+
+    if (( now - last_check > 86400 )); then
+        echo "$now" > "$CONFIG_DIR/.last_update_check" 2>/dev/null
+        check_update true
+    fi
 }
 
 # ─── Network Detection ────────────────────────────────────────────────────────
@@ -299,6 +444,7 @@ reset()      { no_root "reset"; }
 menu() {
     check_deps
     detect_network
+    auto_check_update
 
     local -a DEVICES=()
 
@@ -362,6 +508,7 @@ menu() {
         echo -e "  ${CYAN}[8]${NC} Monitor mode"
         echo -e "  ${CYAN}[9]${NC} Export scan"
         echo -e "  ${YELLOW}[4-7,R]${NC} Block/throttle/reset — ${RED}disabled, needs root${NC}"
+        echo -e "  ${CYAN}[U]${NC} Check for updates / Update"
         echo -e "  ${CYAN}[Q]${NC} Quit"
         echo ""
         read -rp "$(echo -e "  ${BOLD}Choice: ${NC}")" choice
@@ -389,6 +536,7 @@ menu() {
                 read -rp "Press Enter..." _
                 ;;
             4|5|6|7|r) no_root "this action"; read -rp "Press Enter..." _ ;;
+            u) apply_update; read -rp "Press Enter..." _ ;;
             q) echo -e "\n${GREEN}Goodbye!${NC}\n"; exit 0 ;;
             *) warn "Unknown option."; sleep 1 ;;
         esac
@@ -402,6 +550,7 @@ shift || true
 
 case "$CMD" in
     menu) menu ;;
+    update) apply_update ;;
     scan) check_deps; detect_network; scan "${1:-table}" ;;
     monitor) check_deps; detect_network; monitor "${1:-30}" ;;
     identify|info|probe) check_deps; detect_network; identify "$1" ;;
@@ -426,6 +575,7 @@ ${BOLD}Commands:${NC}
   identify <ip|mac>        Fingerprint a device (ports, vendor, rDNS)
   list                    Show blocked/throttled status (n/a, no root)
   export [csv|json]       Export scan to $CONFIG_DIR/
+  update                  Check and apply automatic updates
   help                    Show this help
 
 ${BOLD}Disabled (need root):${NC} block, unblock, throttle, unthrottle, reset
