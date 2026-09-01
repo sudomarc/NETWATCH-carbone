@@ -1,30 +1,29 @@
 # Contributing to netwatch
 
-Thanks for your interest! Here's how to contribute.
+Thanks for contributing to netwatch.
+
+## Scope
+
+netwatch is a Linux-only Bash project. Keep the repository focused on `netwatch.sh` and Linux tooling.
 
 ## Getting Started
 
-1. Fork the repo
-2. Create a feature branch: `git checkout -b feature/my-feature`
-3. Make your changes
-4. Test on a real Linux machine (ideally a gateway/router)
-5. Submit a pull request with a clear description
+1. Fork the repository.
+2. Create a feature branch: `git checkout -b feature/my-feature`.
+3. Make your changes.
+4. Run `bash -n netwatch.sh` and relevant functional tests.
+5. Run ShellCheck when available.
+6. Submit a pull request with a clear description of the change and validation performed.
 
 ## Guidelines
 
-- Keep it Bash — no Python/Go rewrites please; the goal is a zero-install single-file script
-- Test with `--dry-run` before submitting changes to block/throttle/reset logic
-- Document any new commands in both the `help` case and `README.md`
-- Keep the single-file structure; don't split into multiple scripts
+- Keep it Bash; do not rewrite the project in another language.
+- Preserve the single-file Linux implementation unless a structural change is technically justified.
+- Test `--dry-run` before changes involving block, throttle, or reset.
+- Document new commands in both `help` and `README.md`.
+- Do not add Android, Termux, Windows, or PowerShell implementations.
+- Do not add features designed to attack or disrupt networks without authorization.
 
-## Ideas for contribution
+## Security
 
-- Extend the vendor OUI table with more prefixes
-- Add IPv6 support
-- Improve OS fingerprinting hints in `identify`
-- Add a `watch` mode that alerts on new/unknown devices
-- Shell completion scripts (bash/zsh)
-
-## Ethical use reminder
-
-All contributions must be scoped to legitimate network administration use cases on networks the user owns or controls. PRs that add features designed to attack or disrupt networks without authorization will not be accepted.
+Report security issues privately where possible. Never commit credentials, tokens, private keys, personal network logs, or generated runtime state.
