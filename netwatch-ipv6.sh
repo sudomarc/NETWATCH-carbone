@@ -3,7 +3,6 @@
 # Usage: netwatch-ipv6.sh <command> [args]
 
 set -u
-
 CONFIG_DIR="${NETWATCH_CONFIG:-$HOME/.config/netwatch}"
 BLOCK_FILE="$CONFIG_DIR/blocked_ipv6"
 DRY_RUN=false
@@ -11,13 +10,11 @@ IFACE=""
 GLOBAL_IPV6=""
 PREFIX_LEN=""
 GATEWAY_IPV6=""
-
 info(){ printf '[+] %s\n' "$*"; }
 ok(){ printf '[✓] %s\n' "$*"; }
 warn(){ printf '[!] %s\n' "$*" >&2; }
 die(){ printf '[x] %s\n' "$*" >&2; exit 1; }
 require_root(){ [[ ${EUID:-1} -eq 0 ]] || die 'This command requires root. Run with sudo.'; }
-
 valid_ipv6(){
     [[ -n "$1" ]] || return 1
     python3 - "$1" <<'PY'
@@ -28,16 +25,12 @@ except Exception:
     raise SystemExit(1)
 PY
 }
-
 check_deps(){
     local missing=()
-    for dep in ip nmap awk; do
-        command -v "$dep" >/dev/null 2>&1 || missing+=("$dep")
-    done
+    for dep in ip nmap awk; do command -v "$dep" >/dev/null 2>&1 || missing+=("$dep"); done
     if (( ${#missing[@]} )); then die "Missing dependencies: ${missing[*]}"; fi
     if [[ "$1" == control ]] && ! command -v ip6tables >/dev/null 2>&1; then die 'ip6tables is required for IPv6 blocking.'; fi
 }
-
 detect_ipv6(){
     IFACE=$(ip -6 route show default 2>/dev/null | awk 'NR==1 {print $5; exit}')
     [[ -n "$IFACE" ]] || die 'No IPv6 default route/interface found.'
@@ -49,14 +42,10 @@ detect_ipv6(){
     GATEWAY_IPV6=$(ip -6 route show default dev "$IFACE" 2>/dev/null | awk '/default/ {print $3; exit}')
     info "Interface: $IFACE | IPv6: $addr${GATEWAY_IPV6:+ | Gateway: $GATEWAY_IPV6}"
 }
-
 scan(){
-    local format="${1:-table}"
-    detect_ipv6
-    info "Discovering IPv6 neighbors on $IFACE ..."
+    local format="${1:-table}"; detect_ipv6; info "Discovering IPv6 neighbors on $IFACE ..."
     if command -v ping >/dev/null 2>&1; then ping -6 -c 1 -W 2 -I "$IFACE" ff02::1 >/dev/null 2>&1 || true; fi
-    local tmp
-    tmp=$(mktemp "${TMPDIR:-/tmp}/netwatch6_XXXXXX") || die 'Cannot create temporary file.'
+    local tmp; tmp=$(mktemp "${TMPDIR:-/tmp}/netwatch6_XXXXXX") || die 'Cannot create temporary file.'
     trap 'rm -f -- "$tmp"' EXIT
     ip -6 neigh show dev "$IFACE" 2>/dev/null | awk '$1 ~ /^[0-9a-fA-F:]+$/ && $2 != "FAILED" && $2 != "INCOMPLETE" {print}' > "$tmp"
     case "$format" in
@@ -65,22 +54,9 @@ scan(){
         *) printf '%-42s %-20s %s\n' 'IPv6 Address' 'MAC' 'State'; printf '%s\n' '--------------------------------------------------------------------------------'; while read -r ipaddr _ state _ mac _; do [[ -z "$ipaddr" ]] && continue; printf '%-42s %-20s %s\n' "$ipaddr" "${mac:---}" "${state:--}"; done < "$tmp" ;;
     esac
 }
-
-identify(){
-    local target="${1:-}"
-    [[ -n "$target" ]] || die 'Usage: netwatch-ipv6.sh identify <ipv6>'
-    valid_ipv6 "$target" || die "Invalid IPv6 address: '$target'"
-    command -v nmap >/dev/null 2>&1 || die 'nmap is required for IPv6 identification.'
-    info "Probing IPv6 target $target ..."
-    nmap -6 -sV -O --osscan-guess --max-retries 1 --host-timeout 30s -T4 "$target"
-}
-
+identify(){ local target="${1:-}"; [[ -n "$target" ]] || die 'Usage: netwatch-ipv6.sh identify <ipv6>'; valid_ipv6 "$target" || die "Invalid IPv6 address: '$target'"; command -v nmap >/dev/null 2>&1 || die 'nmap is required for IPv6 identification.'; info "Probing IPv6 target $target ..."; nmap -6 -sV -O --osscan-guess --max-retries 1 --host-timeout 30s -T4 "$target"; }
 block(){
-    require_root
-    local target="${1:-}"
-    [[ -n "$target" ]] || die 'Usage: netwatch-ipv6.sh block <ipv6>'
-    valid_ipv6 "$target" || die "Invalid IPv6 address: '$target'"
-    detect_ipv6
+    require_root; local target="${1:-}"; [[ -n "$target" ]] || die 'Usage: netwatch-ipv6.sh block <ipv6>'; valid_ipv6 "$target" || die "Invalid IPv6 address: '$target'"; detect_ipv6
     [[ "$target" != "$GATEWAY_IPV6" ]] || die 'Refusing to block the default IPv6 gateway.'
     [[ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null || printf 0)" == 1 ]] || die 'IPv6 blocking requires this Linux host to be the IPv6 router/gateway (forwarding=1).'
     mkdir -p "$CONFIG_DIR"
@@ -92,21 +68,15 @@ block(){
     grep -Fqx -- "$target" "$BLOCK_FILE" 2>/dev/null || printf '%s\n' "$target" >> "$BLOCK_FILE"
     ok "IPv6 block added for $target"
 }
-
 unblock(){
-    require_root
-    local target="${1:-}"
-    [[ -n "$target" ]] || die 'Usage: netwatch-ipv6.sh unblock <ipv6>'
-    valid_ipv6 "$target" || die "Invalid IPv6 address: '$target'"
+    require_root; local target="${1:-}"; [[ -n "$target" ]] || die 'Usage: netwatch-ipv6.sh unblock <ipv6>'; valid_ipv6 "$target" || die "Invalid IPv6 address: '$target'"
     if $DRY_RUN; then warn "[DRY-RUN] ip6tables would remove DROP rules for $target"; return 0; fi
     ip6tables -D NETWATCH6_BLOCK -s "$target" -j DROP 2>/dev/null || true
     ip6tables -D NETWATCH6_BLOCK -d "$target" -j DROP 2>/dev/null || true
     [[ -f "$BLOCK_FILE" ]] && sed -i "|^${target}$|d" "$BLOCK_FILE" 2>/dev/null || true
     ok "IPv6 block removed for $target"
 }
-
-show_help(){
-    cat <<'EOF'
+show_help(){ cat <<'EOF'
 netwatch-ipv6 — Linux IPv6 discovery and gateway control helper
 
 Usage:
@@ -123,17 +93,9 @@ Notes:
   Blocking is gateway/router-only and requires IPv6 forwarding.
 EOF
 }
-
-args=()
-for arg in "$@"; do
-    case "$arg" in
-        --dry-run) DRY_RUN=true ;;
-        *) args+=("$arg") ;;
-    esac
-done
+args=(); for arg in "$@"; do case "$arg" in --dry-run) DRY_RUN=true;; *) args+=("$arg");; esac; done
 set -- "${args[@]+"${args[@]}"}"
-CMD="${1:-help}"
-shift || true
+CMD="${1:-help}"; shift || true
 case "$CMD" in
     scan) check_deps scan; scan "${1:-table}" ;;
     identify) check_deps identify; identify "${1:-}" ;;
