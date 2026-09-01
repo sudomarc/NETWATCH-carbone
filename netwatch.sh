@@ -2,11 +2,11 @@
 # netwatch — Network monitor & control tool
 # Usage: netwatch <cmd> [args]
 
-VERSION="1.2"
-UPDATE_URL="https://raw.githubusercontent.com/sudomarc/NETWATCH-carbone/main/netwatch.sh"
-SCRIPT_NAME=$(basename "$0")
-CONFIG_DIR="${NETWATCH_CONFIG:-$HOME/.config/netwatch}"
+VERSION="1.3.0"
+SCRIPT_NAME="$(basename "$0")"
+CONFIG_DIR="${NETWATCH_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/netwatch}"
 BLOCK_FILE="$CONFIG_DIR/blocked_macs"
+BLOCK_IP_FILE="$CONFIG_DIR/blocked_ips"
 THROTTLE_FILE="$CONFIG_DIR/throttled_macs"
 SCAN_LOG="$CONFIG_DIR/scan_history.log"
 SUBNET=""
@@ -14,6 +14,7 @@ GATEWAY=""
 IFACE=""
 DRY_RUN=false
 PERSISTENT=false
+TMP_FILE=""
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -23,1022 +24,371 @@ CYAN='\033[0;36m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-# ─── Utilities ────────────────────────────────────────────────────────────────
+info(){ printf '%b[.]%b %s\n' "$BLUE" "$NC" "$*"; }
+ok(){ printf '%b[OK]%b %s\n' "$GREEN" "$NC" "$*"; }
+warn(){ printf '%b[!]%b %s\n' "$YELLOW" "$NC" "$*" >&2; }
+err(){ printf '%b[X]%b %s\n' "$RED" "$NC" "$*" >&2; }
+die(){ err "$*"; exit 1; }
+command_exists(){ command -v "$1" >/dev/null 2>&1; }
+log(){ mkdir -p "$CONFIG_DIR" || return 1; printf '[%s] %s\n' "$(date '+%F %T')" "$*" >>"$SCAN_LOG"; }
+cleanup(){ [[ -n "$TMP_FILE" && -f "$TMP_FILE" ]] && rm -f -- "$TMP_FILE"; }
+trap cleanup EXIT INT TERM
 
-version_gt() {
-    # Compare semver or standard version strings
-    local ip1 ip2
-    IFS='.' read -r -a ip1 <<< "$1"
-    IFS='.' read -r -a ip2 <<< "$2"
-    # Pad to equal length
-    for ((i=${#ip1[@]}; i<3; i++)); do ip1[i]=0; done
-    for ((i=${#ip2[@]}; i<3; i++)); do ip2[i]=0; done
-    for ((i=0; i<3; i++)); do
-        if ((10#${ip1[i]} > 10#${ip2[i]})); then
-            return 0
-        elif ((10#${ip1[i]} < 10#${ip2[i]})); then
-            return 1
-        fi
-    done
+require_root(){ ((EUID==0)) || die "This command requires root. Run with sudo."; }
+require_deps(){ local d missing=(); for d in "$@"; do command_exists "$d" || missing+=("$d"); done; ((${#missing[@]}==0)) || die "Missing dependencies: ${missing[*]}"; }
+
+is_valid_ipv4(){
+  local IFS=. parts x
+  read -r -a parts <<<"$1"
+  [[ ${#parts[@]} -eq 4 ]] || return 1
+  for x in "${parts[@]}"; do [[ "$x" =~ ^[0-9]+$ && "$x" -le 255 ]] || return 1; done
+}
+is_valid_mac(){ [[ "${1^^}" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]; }
+normalize_mac(){ printf '%s\n' "${1^^}"; }
+is_valid_speed(){
+  local n u
+  [[ "$1" =~ ^([1-9][0-9]{0,8})(kbit|mbit|gbit|kbps|mbps)$ ]] || return 1
+  n=${BASH_REMATCH[1]}; u=${BASH_REMATCH[2]}
+  case "$u" in
+    kbit|kbps) ((n<=1000000)) ;;
+    mbit|mbps) ((n<=1000)) ;;
+    gbit) ((n<=1)) ;;
+  esac
+}
+version_gt(){
+  local a b i va vb
+  [[ "$1" =~ ^[0-9]+(\.[0-9]+){0,2}$ && "$2" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || return 2
+  IFS=. read -r -a a <<<"$1"; IFS=. read -r -a b <<<"$2"
+  for ((i=0;i<3;i++)); do
+    va="${a[i]:-0}"; vb="${b[i]:-0}"
+    ((10#$va>10#$vb)) && return 0
+    ((10#$va<10#$vb)) && return 1
+  done
+  return 1
+}
+json_escape(){
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/\\t/g; s/\r/\\r/g'
+}
+csv_escape(){ local s="$1"; s=${s//"/""}; printf '"%s"' "$s"; }
+
+check_deps(){
+  case "$1" in
+    scan|monitor|export|identify) require_deps nmap ip awk ;;
+    block|unblock) require_deps ip iptables awk ;;
+    throttle|unthrottle) require_deps ip iptables tc awk ;;
+    reset) require_deps iptables tc ;;
+    menu) return 0 ;;
+    *) return 2 ;;
+  esac
+}
+
+check_update(){
+  local body remote
+  if command_exists curl; then
+    body=$(curl -fsSL --max-time 5 'https://raw.githubusercontent.com/sudomarc/NETWATCH-carbone/main/netwatch.sh') || { warn 'Update check failed.'; return 1; }
+  elif command_exists wget; then
+    body=$(wget -qO- --timeout=5 'https://raw.githubusercontent.com/sudomarc/NETWATCH-carbone/main/netwatch.sh') || { warn 'Update check failed.'; return 1; }
+  else
+    warn 'curl/wget unavailable; update check skipped.'
     return 1
+  fi
+  remote=$(printf '%s\n' "$body" | awk -F'"' '/^VERSION=/{print $2; exit}')
+  [[ "$remote" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]] || { err 'Invalid remote version; rejected.'; return 1; }
+  if version_gt "$remote" "$VERSION"; then
+    warn "Update available: v$remote (current v$VERSION). Install from a reviewed Git commit/tag manually."
+    return 0
+  fi
+  ok "Up to date: v$VERSION"
+  return 1
+}
+apply_update(){
+  check_update || return 1
+  warn 'Automatic self-update is disabled for supply-chain safety.'
+  return 1
+}
+auto_check_update(){ :; }
+
+detect_network(){
+  local ipaddr network
+  GATEWAY=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $3}')
+  IFACE=$(ip -4 route show default 2>/dev/null | awk 'NR==1{print $5}')
+  [[ -n "$GATEWAY" && -n "$IFACE" ]] || die 'No default IPv4 route found.'
+  ipaddr=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk 'NR==1{print $4}')
+  [[ "$ipaddr" == */* ]] || die "No global IPv4 address on $IFACE."
+  network=$(ip -4 route show dev "$IFACE" proto kernel scope link 2>/dev/null | awk -v host="${ipaddr%/*}" '$1 ~ /\// {for(i=1;i<=NF;i++) if($i=="src" && $(i+1)==host){print $1; exit}}')
+  [[ -n "$network" ]] || die 'Unable to determine the connected prefix safely; refusing to assume /24.'
+  SUBNET="$network"
+  info "Interface: $IFACE | Subnet: $SUBNET | Gateway: $GATEWAY"
 }
 
-log()     { mkdir -p "$CONFIG_DIR"; echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$SCAN_LOG"; }
-info()    { echo -e "${BLUE}[•]${NC} $*"; }
-ok()      { echo -e "${GREEN}[✓]${NC} $*"; }
-warn()    { echo -e "${YELLOW}[!]${NC} $*"; }
-err()     { echo -e "${RED}[✗]${NC} $*" >&2; }
-die()     { err "$*"; exit 1; }
-require() { [[ "$EUID" -eq 0 ]] || die "This command requires root. Run with sudo."; }
+vendor(){ case "${1^^}" in
+  00:1A:2B*|00:50:56*|00:0C:29*|00:05:69*) echo VMware;; 00:1C:42*) echo Parallels;;
+  00:03:93*|A4:4C:C8*|00:26:9E*|00:0D:93*|3C:07:54*|A8:86:DD*) echo Apple;;
+  00:1E:58*|00:1F:3A*|00:21:5C*|14:18:77*) echo Dell;; 00:1A:A0*|00:1E:4C*|00:24:E8*|30:8D:99*) echo HP;;
+  00:25:90*|00:1B:21*|00:1D:09*|8C:EC:4B*) echo Intel;; 00:16:E9*|00:18:7D*|00:1F:33*|F8:7B:20*) echo Cisco;;
+  20:CF:30*|2C:B0:5D*|64:B4:73*) echo Xiaomi;; 00:1F:82*|D4:61:9D*|00:E0:FC*) echo Huawei;;
+  A4:77:33*|AC:CF:85*|40:B0:34*|B4:79:A7*) echo Samsung;; AC:22:0B*|B8:5A:73*|F0:F6:1C*|04:D9:F5*) echo Asus;;
+  18:B4:30*|FC:D7:33*|48:45:20*|54:AF:97*) echo TP-Link;; 00:26:B6*|00:27:0E*|9C:5C:8E*|20:4E:7F*) echo Netgear;;
+  B8:27:EB*|DC:A6:32*|E4:5F:01*) echo Raspberry-Pi;; 00:15:5D*) echo Hyper-V;; *) echo Unknown;; esac; }
 
-cleanup() { rm -f /tmp/netwatch_*.tmp 2>/dev/null; }
-trap cleanup EXIT
-
-check_deps() {
-    local missing=()
-    for dep in nmap iptables ip awk tc; do
-        command -v "$dep" &>/dev/null || missing+=("$dep")
-    done
-    [[ ${#missing[@]} -gt 0 ]] && die "Missing dependencies: ${missing[*]}"
+resolve_target(){
+  local target="$1" ip mac
+  is_valid_mac "$target" || is_valid_ipv4 "$target" || die 'Target must be a valid IPv4 address or MAC address.'
+  if is_valid_mac "$target"; then
+    mac=$(normalize_mac "$target")
+    ip=$(ip neigh show dev "$IFACE" 2>/dev/null | awk -v m="$mac" 'toupper($5)==m{print $1; exit}')
+  else
+    ip="$target"
+    mac=$(ip neigh show dev "$IFACE" "$ip" 2>/dev/null | awk 'NR==1 && $5 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/{print toupper($5); exit}')
+  fi
+  [[ -n "$ip" ]] || die 'Target is not present in the current neighbor table.'
+  printf '%s|%s\n' "$ip" "${mac:---}"
 }
 
-# ─── Automatic Updates ────────────────────────────────────────────────────────
-
-check_update() {
-    local silent="${1:-false}"
-
-    mkdir -p "$CONFIG_DIR"
-
-    if ! command -v curl &>/dev/null && ! command -v wget &>/dev/null; then
-        $silent || err "Neither curl nor wget is installed. Cannot check for updates."
-        return 1
-    fi
-
-    local remote_version=""
-    if $silent; then
-        if command -v curl &>/dev/null; then
-            remote_version=$(curl -sSL --max-time 3 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
-        else
-            remote_version=$(wget -qO- --timeout=3 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
-        fi
-    else
-        info "Checking for updates..."
-        if command -v curl &>/dev/null; then
-            remote_version=$(curl -sSL --max-time 8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
-        else
-            remote_version=$(wget -qO- --timeout=8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
-        fi
-    fi
-
-    if [[ -z "$remote_version" ]]; then
-        $silent || err "Failed to fetch remote version information."
-        return 1
-    fi
-
-    if version_gt "$remote_version" "$VERSION"; then
-        if $silent; then
-            echo -e "\n${YELLOW}[!] A new version of netwatch is available: v$remote_version (current: v$VERSION)${NC}"
-            echo -e "${YELLOW}[!] Run '$SCRIPT_NAME update' or select 'U' in the menu to update.${NC}\n"
-        else
-            ok "A new version of netwatch is available: v$remote_version (current: v$VERSION)"
-            return 0
-        fi
-    else
-        $silent || ok "netwatch is up-to-date (v$VERSION)."
-        return 1
-    fi
-}
-
-apply_update() {
-    # Check if update is available
-    if ! check_update false; then
-        return 0
-    fi
-
-    local remote_version=""
-    if command -v curl &>/dev/null; then
-        remote_version=$(curl -sSL --max-time 8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
-    else
-        remote_version=$(wget -qO- --timeout=8 "$UPDATE_URL" 2>/dev/null | grep "^VERSION=" | head -n1 | cut -d'"' -f2)
-    fi
-
-    [[ -z "$remote_version" ]] && die "Error fetching remote version."
-
-    local tmp_file
-    tmp_file=$(mktemp "${TMPDIR:-/tmp}/netwatch_update_XXXXXX.sh")
-
-    info "Downloading netwatch v$remote_version..."
-    if command -v curl &>/dev/null; then
-        curl -sSL --max-time 15 -o "$tmp_file" "$UPDATE_URL"
-    else
-        wget -qO "$tmp_file" --timeout=15 "$UPDATE_URL"
-    fi
-
-    if [[ ! -s "$tmp_file" ]]; then
-        rm -f "$tmp_file"
-        die "Download failed or empty file."
-    fi
-
-    if ! grep -q "^#!/bin/bash" "$tmp_file"; then
-        rm -f "$tmp_file"
-        die "Downloaded file is invalid (missing shebang)."
-    fi
-
-    local target_script="$0"
-    local real_script
-    real_script=$(readlink -f "$target_script" 2>/dev/null || realpath "$target_script" 2>/dev/null || echo "$target_script")
-
-    if [[ ! -w "$real_script" ]]; then
-        err "No write permissions to update '$real_script'."
-        err "Please run with sudo: sudo $SCRIPT_NAME update"
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    info "Backing up current script to ${real_script}.bak..."
-    cp "$real_script" "${real_script}.bak" || die "Failed to create backup."
-
-    info "Applying update..."
-    mv "$tmp_file" "$real_script" || {
-        mv "${real_script}.bak" "$real_script"
-        die "Failed to replace the script file. Restored backup."
-    }
-
-    chmod +x "$real_script"
-    ok "Successfully updated netwatch to v$remote_version!"
-    rm -f "${real_script}.bak"
-
-    info "Restarting netwatch..."
-    exec "$real_script" "$@"
-}
-
-auto_check_update() {
-    local last_check=0
-    if [[ -f "$CONFIG_DIR/.last_update_check" ]]; then
-        last_check=$(cat "$CONFIG_DIR/.last_update_check" 2>/dev/null || echo 0)
-    fi
-
-    local now
-    now=$(date +%s 2>/dev/null || echo 0)
-
-    if (( now - last_check > 86400 )); then
-        echo "$now" > "$CONFIG_DIR/.last_update_check" 2>/dev/null
-        check_update true
-    fi
-}
-
-# ─── Network Detection ────────────────────────────────────────────────────────
-
-detect_network() {
-    GATEWAY=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-    [[ -z "$GATEWAY" ]] && die "No default gateway found."
-
-    IFACE=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-    [[ -z "$IFACE" ]] && die "No default interface found."
-
-    local ip
-    ip=$(ip addr show "$IFACE" 2>/dev/null | awk '/inet / {print $2; exit}')
-    [[ -z "$ip" ]] && die "No local IP on interface $IFACE."
-
-    local prefix="${ip#*/}"
-    local base
-    base=$(ipcalc -n "$ip" 2>/dev/null | awk -F= '/^NETWORK/ {print $2}')
-    if [[ -n "$base" ]]; then
-        SUBNET="$base/$prefix"
-    else
-        SUBNET="$(echo "${ip%/*}" | cut -d'.' -f1-3).0/24"
-    fi
-
-    info "Interface: $IFACE | Subnet: $SUBNET | Gateway: $GATEWAY"
-}
-
-# ─── Vendor Lookup ────────────────────────────────────────────────────────────
-
-vendor() {
-    local mac="${1^^}"
-    local oui
-    oui=$(echo "$mac" | cut -d':' -f1-3)
-
-    case "$oui" in
-        00:1A:2B|00:50:56|00:0C:29|00:05:69) echo "VMware" ;;
-        00:1C:42)                              echo "Parallels" ;;
-        00:03:93|A4:4C:C8|00:26:9E|00:0D:93|3C:07:54|A8:86:DD) echo "Apple" ;;
-        00:1E:58|00:1F:3A|00:21:5C|14:18:77) echo "Dell" ;;
-        00:1A:A0|00:1E:4C|00:24:E8|30:8D:99) echo "HP" ;;
-        00:25:90|00:1B:21|00:1D:09|8C:EC:4B) echo "Intel" ;;
-        00:16:E9|00:18:7D|00:1F:33|F8:7B:20) echo "Cisco" ;;
-        20:CF:30|2C:B0:5D|64:B4:73)          echo "Xiaomi" ;;
-        00:1F:82|D4:61:9D|00:E0:FC)          echo "Huawei" ;;
-        A4:77:33|AC:CF:85|40:B0:34|B4:79:A7) echo "Samsung" ;;
-        AC:22:0B|B8:5A:73|F0:F6:1C|04:D9:F5) echo "Asus" ;;
-        18:B4:30|FC:D7:33|48:45:20|54:AF:97) echo "TP-Link" ;;
-        00:26:B6|00:27:0E|9C:5C:8E|20:4E:7F) echo "Netgear" ;;
-        B8:27:EB|DC:A6:32|E4:5F:01)          echo "Raspberry Pi" ;;
-        00:15:5D)                              echo "Hyper-V" ;;
-        *)                                     echo "Unknown" ;;
-    esac
-}
-
-# ─── Validation ───────────────────────────────────────────────────────────────
-
-is_valid_mac() {
-    [[ "${1^^}" =~ ^([0-9A-F]{2}:){5}[0-9A-F]{2}$ ]]
-}
-
-is_valid_speed() {
-    [[ "$1" =~ ^[0-9]+(kbit|mbit|gbit|kbps|mbps)$ ]]
-}
-
-normalize_mac() {
-    echo "${1^^}"
-}
-
-# ─── Scan ─────────────────────────────────────────────────────────────────────
-
-scan() {
-    local format="${1:-table}"
-    info "Scanning $SUBNET ..."
-
-    mkdir -p "$CONFIG_DIR"
-    local tmp
-    tmp=$(mktemp /tmp/netwatch_XXXX.tmp)
-
-    nmap -sn -PR "$SUBNET" \
-        --max-retries 2 \
-        --host-timeout 8s \
-        -oG - 2>/dev/null \
-        | awk '/^Host:/ && /Up/' > "$tmp"
-
-    ip neigh flush nud stale 2>/dev/null || true
-
-    local count=0
-    local -a results=()
-
-    while read -r line; do
-        local ip
-        ip=$(awk '{print $2}' <<< "$line")
-        [[ "$ip" == "$GATEWAY" ]] && continue
-
-        local mac
-        mac=$(ip neigh show "$ip" 2>/dev/null | awk 'NR==1 {print $5}')
-        [[ -z "$mac" || "$mac" == "FAILED" || "$mac" == "INCOMPLETE" ]] && mac="--"
-
-        local hostname
-        hostname=$(timeout 1 bash -c "getent hosts $ip 2>/dev/null | awk '{print \$2}'" 2>/dev/null || echo "-")
-        [[ -z "$hostname" ]] && hostname="-"
-
-        local v="-"
-        [[ "$mac" != "--" ]] && v=$(vendor "$mac")
-
-        local blocked="-"
-        [[ "$mac" != "--" ]] && grep -qi "^$(normalize_mac "$mac")$" "$BLOCK_FILE" 2>/dev/null && blocked="BLOCKED"
-
-        local throttled="-"
-        if [[ "$mac" != "--" ]]; then
-            local throttle_entry
-            throttle_entry=$(grep -i "^$(normalize_mac "$mac")|" "$THROTTLE_FILE" 2>/dev/null | cut -d'|' -f2)
-            [[ -n "$throttle_entry" ]] && throttled="$throttle_entry"
-        fi
-
-        results+=("$ip|$mac|$hostname|$v|$blocked|$throttled")
-        ((count++))
-    done < "$tmp"
-
+scan(){
+  local format="${1:-table}" line ip mac host v blocked throttled count=0 first=true
+  [[ "$format" == table || "$format" == json || "$format" == csv || "$format" == raw ]] || die 'Format must be table, json, csv, or raw.'
+  [[ -n "$SUBNET" ]] || detect_network
+  check_deps scan
+  TMP_FILE=$(mktemp "${TMPDIR:-/tmp}/netwatch.XXXXXX") || die 'Unable to create temporary file.'
+  nmap -sn "$SUBNET" --max-retries 2 --host-timeout 8s -oG - >"$TMP_FILE" 2>/dev/null || die 'nmap scan failed.'
+  case "$format" in json) echo '[';; csv) echo 'ip,mac,hostname,vendor,blocked,throttled';; esac
+  while IFS= read -r line; do
+    [[ "$line" =~ ^Host:\ ([^[:space:]]+).*Status:\ Up ]] || continue
+    ip="${BASH_REMATCH[1]}"
+    [[ "$ip" == "$GATEWAY" ]] && continue
+    mac=$(ip neigh show "$ip" 2>/dev/null | awk 'NR==1 && $5 ~ /^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$/{print toupper($5); exit}')
+    [[ -n "$mac" ]] || mac=--
+    host=$(getent hosts "$ip" 2>/dev/null | awk 'NR==1{print $2}') || true
+    [[ -n "$host" ]] || host=-
+    v=-; [[ "$mac" != -- ]] && v=$(vendor "$mac")
+    blocked=-; [[ "$mac" != -- && -f "$BLOCK_FILE" ]] && grep -Fqi -x -- "$mac" "$BLOCK_FILE" 2>/dev/null && blocked=BLOCKED
+    throttled=-; [[ "$mac" != -- && -f "$THROTTLE_FILE" ]] && throttled=$(awk -F'|' -v m="$mac" 'toupper($1)==m{print $2; exit}' "$THROTTLE_FILE"); [[ -n "$throttled" ]] || throttled=-
+    ((count++))
     case "$format" in
-        json)
-            echo "["
-            local first=true
-            for r in "${results[@]}"; do
-                IFS='|' read -r rip rmac rhost rv rblock rthrottle <<< "$r"
-                $first || echo ","
-                first=false
-                printf '  {"ip":"%s","mac":"%s","hostname":"%s","vendor":"%s","blocked":"%s","throttled":"%s"}' \
-                    "$rip" "$rmac" "$rhost" "$rv" "$rblock" "$rthrottle"
-            done
-            echo ""
-            echo "]"
-            ;;
-        csv)
-            echo "ip,mac,hostname,vendor,blocked,throttled"
-            for r in "${results[@]}"; do
-                echo "$r" | tr '|' ','
-            done
-            ;;
-        raw)
-            # For internal use by menu — returns pipe-separated lines
-            for r in "${results[@]}"; do
-                echo "$r"
-            done
-            ;;
-        *)
-            echo ""
-            printf "${BOLD}%-3s %-16s %-18s %-22s %-12s %-10s %-10s${NC}\n" \
-                "#" "IP" "MAC" "Hostname" "Vendor" "Blocked" "Throttled"
-            printf '%s\n' "$(printf '─%.0s' {1..95})"
-
-            local idx=1
-            for r in "${results[@]}"; do
-                IFS='|' read -r rip rmac rhost rv rblock rthrottle <<< "$r"
-                local color=""
-                [[ "$rblock" == "BLOCKED" ]] && color="$RED"
-                [[ -n "$rthrottle" && "$rthrottle" != "-" ]] && color="$YELLOW"
-                printf "${color}%-3s %-16s %-18s %-22s %-12s %-10s %-10s${NC}\n" \
-                    "$idx" "$rip" "$rmac" "${rhost:0:22}" "${rv:0:12}" "$rblock" "$rthrottle"
-                ((idx++))
-            done
-            echo ""
-            ok "$count device(s) found."
-            ;;
+      json) $first || echo ','; first=false; printf '  {"ip":"%s","mac":"%s","hostname":"%s","vendor":"%s","blocked":"%s","throttled":"%s"}' "$(json_escape "$ip")" "$(json_escape "$mac")" "$(json_escape "$host")" "$(json_escape "$v")" "$(json_escape "$blocked")" "$(json_escape "$throttled")";;
+      csv) printf '%s,%s,%s,%s,%s,%s\n' "$(csv_escape "$ip")" "$(csv_escape "$mac")" "$(csv_escape "$host")" "$(csv_escape "$v")" "$(csv_escape "$blocked")" "$(csv_escape "$throttled")";;
+      raw) printf '%s|%s|%s|%s|%s|%s\n' "$ip" "$mac" "$host" "$v" "$blocked" "$throttled";;
+      table) printf '%-16s %-18s %-22s %-12s %-10s %-10s\n' "$ip" "$mac" "${host:0:22}" "${v:0:12}" "$blocked" "$throttled";;
     esac
-
-    log "scan: $count devices on $SUBNET"
-    rm -f "$tmp"
+  done <"$TMP_FILE"
+  [[ "$format" == json ]] && printf '\n]\n'; [[ "$format" == table ]] && ok "$count device(s) found."
+  log "scan: $count devices on $SUBNET"
+  rm -f -- "$TMP_FILE"; TMP_FILE=""
 }
 
-# ─── Monitor Mode ─────────────────────────────────────────────────────────────
-
-monitor() {
-    local interval="${1:-30}"
-    [[ ! "$interval" =~ ^[0-9]+$ ]] && die "Interval must be a number (seconds)."
-    info "Monitor mode: scanning every ${interval}s. Press Ctrl+C to stop."
-    while true; do
-        clear
-        echo -e "${BOLD}${CYAN}╔══════════════════════════════╗"
-        echo -e "║   NETWATCH — $(date '+%H:%M:%S')      ║"
-        echo -e "╚══════════════════════════════╝${NC}"
-        scan table
-        sleep "$interval"
-    done
+block(){
+  require_root; check_deps block; [[ -n "$IFACE" ]] || detect_network; local pair ip mac
+  pair=$(resolve_target "$1"); IFS='|' read -r ip mac <<<"$pair"
+  [[ "$ip" != "$GATEWAY" ]] || die 'Refusing to block the default gateway.'
+  [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == 1 ]] || die 'This host is not an IPv4 gateway/router. No ARP spoofing is performed.'
+  $DRY_RUN && { warn "[DRY-RUN] Would add NETWATCH_BLOCK rules for $ip${mac:+ / $mac}."; return 0; }
+  mkdir -p "$CONFIG_DIR" || die 'Cannot create config directory.'
+  iptables -N NETWATCH_BLOCK 2>/dev/null || true
+  iptables -C FORWARD -j NETWATCH_BLOCK 2>/dev/null || iptables -I FORWARD 1 -j NETWATCH_BLOCK || die 'Failed to attach Netwatch firewall chain.'
+  iptables -C NETWATCH_BLOCK -s "$ip" -j DROP 2>/dev/null || iptables -A NETWATCH_BLOCK -s "$ip" -j DROP || die 'Failed to add source block.'
+  iptables -C NETWATCH_BLOCK -d "$ip" -j DROP 2>/dev/null || iptables -A NETWATCH_BLOCK -d "$ip" -j DROP || die 'Failed to add destination block.'
+  [[ "$mac" == -- ]] || iptables -C NETWATCH_BLOCK -m mac --mac-source "$mac" -j DROP 2>/dev/null || iptables -A NETWATCH_BLOCK -m mac --mac-source "$mac" -j DROP || die 'Failed to add MAC block.'
+  grep -Fqi -x -- "$ip" "$BLOCK_IP_FILE" 2>/dev/null || printf '%s\n' "$ip" >>"$BLOCK_IP_FILE"
+  [[ "$mac" == -- ]] || { grep -Fqi -x -- "$mac" "$BLOCK_FILE" 2>/dev/null || printf '%s\n' "$mac" >>"$BLOCK_FILE"; }
+  log "block: $ip ($mac)"; ok "Blocked $ip via Netwatch-owned firewall rules."
 }
 
-# ─── Block / Unblock ──────────────────────────────────────────────────────────
-
-block() {
-    require
-    local target="$1"
-    [[ -z "$target" ]] && die "Usage: $SCRIPT_NAME block <ip|mac>"
-
-    local ip mac
-    if is_valid_mac "$target"; then
-        mac=$(normalize_mac "$target")
-        ip=$(ip neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
-        [[ -z "$ip" ]] && die "Cannot resolve IP for $mac. Run scan first."
-    else
-        ip="$target"
-        mac=$(ip neigh show "$ip" 2>/dev/null | awk 'NR==1 {print $5}')
-    fi
-
-    mkdir -p "$CONFIG_DIR"
-    [[ -z "$GATEWAY" ]] && detect_network
-
-    local is_router=false
-    [[ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" == "1" ]] && is_router=true
-
-    if $is_router; then
-        info "Router mode — blocking via iptables"
-        if $DRY_RUN; then
-            warn "[DRY-RUN] iptables DROP for $ip / $mac"
-        else
-            iptables -A FORWARD -s "$ip" -j DROP 2>/dev/null || true
-            iptables -A FORWARD -d "$ip" -j DROP 2>/dev/null || true
-            [[ -n "$mac" ]] && {
-                iptables -A INPUT   -m mac --mac-source "$mac" -j DROP 2>/dev/null || true
-                iptables -A FORWARD -m mac --mac-source "$mac" -j DROP 2>/dev/null || true
-            }
-        fi
-    fi
-
-    if command -v arpspoof &>/dev/null; then
-        info "ARP spoofing $ip (gateway: $GATEWAY)"
-        if $DRY_RUN; then
-            warn "[DRY-RUN] arpspoof -i $IFACE -t $ip $GATEWAY"
-        else
-            sysctl -qw net.ipv4.ip_forward=1 2>/dev/null || true
-            local pidfile="$CONFIG_DIR/arp_${ip//./_}.pid"
-            arpspoof -i "$IFACE" -t "$ip" "$GATEWAY" &>/dev/null &
-            echo $! > "$pidfile"
-            arpspoof -i "$IFACE" -t "$GATEWAY" "$ip" &>/dev/null &
-            echo $! >> "$pidfile"
-            ok "ARP spoof active (PIDs in $pidfile)"
-        fi
-    else
-        warn "arpspoof not found. Install: sudo apt install dsniff"
-    fi
-
-    if [[ -n "$mac" ]]; then
-        grep -qi "^$mac$" "$BLOCK_FILE" 2>/dev/null || echo "$mac" >> "$BLOCK_FILE"
-    fi
-    echo "$ip" >> "$CONFIG_DIR/blocked_ips" 2>/dev/null || true
-
-    $PERSISTENT && _save_iptables
-
-    log "block: $ip ($mac)"
-    ok "Blocked: $ip${mac:+ ($mac)}"
+unblock(){
+  require_root; check_deps unblock; [[ -n "$IFACE" ]] || detect_network; local pair ip mac
+  pair=$(resolve_target "$1"); IFS='|' read -r ip mac <<<"$pair"
+  $DRY_RUN && { warn "[DRY-RUN] Would remove NETWATCH_BLOCK rules for $ip${mac:+ / $mac}."; return 0; }
+  iptables -D NETWATCH_BLOCK -s "$ip" -j DROP 2>/dev/null || true
+  iptables -D NETWATCH_BLOCK -d "$ip" -j DROP 2>/dev/null || true
+  [[ "$mac" == -- ]] || iptables -D NETWATCH_BLOCK -m mac --mac-source "$mac" -j DROP 2>/dev/null || true
+  [[ -f "$BLOCK_FILE" ]] && sed -i -F -x "/${mac}/d" "$BLOCK_FILE" 2>/dev/null || true
+  [[ -f "$BLOCK_IP_FILE" ]] && sed -i -F -x "/${ip}/d" "$BLOCK_IP_FILE" 2>/dev/null || true
+  log "unblock: $ip ($mac)"; ok "Unblocked $ip."
 }
 
-unblock() {
-    require
-    local target="$1"
-    [[ -z "$target" ]] && die "Usage: $SCRIPT_NAME unblock <ip|mac>"
-
-    local ip mac
-    if is_valid_mac "$target"; then
-        mac=$(normalize_mac "$target")
-        ip=$(ip neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
-    else
-        ip="$target"
-        mac=$(ip neigh show "$ip" 2>/dev/null | awk 'NR==1 {print $5}')
-    fi
-
-    [[ -z "$GATEWAY" ]] && detect_network 2>/dev/null || true
-
-    local pidfile="$CONFIG_DIR/arp_${ip//./_}.pid"
-    if [[ -f "$pidfile" ]]; then
-        info "Stopping ARP spoof for $ip ..."
-        while read -r pid; do
-            kill "$pid" 2>/dev/null || true
-        done < "$pidfile"
-        rm -f "$pidfile"
-        if [[ -n "$GATEWAY" && -n "$IFACE" ]]; then
-            arping -c 3 -U -I "$IFACE" "$GATEWAY" &>/dev/null 2>&1 || true
-        fi
-    fi
-
-    [[ -n "$ip" ]] && {
-        iptables -D FORWARD -s "$ip" -j DROP 2>/dev/null || true
-        iptables -D FORWARD -d "$ip" -j DROP 2>/dev/null || true
-    }
-    [[ -n "$mac" ]] && {
-        iptables -D INPUT   -m mac --mac-source "$mac" -j DROP 2>/dev/null || true
-        iptables -D FORWARD -m mac --mac-source "$mac" -j DROP 2>/dev/null || true
-        sed -i "/^${mac}$/Id" "$BLOCK_FILE" 2>/dev/null || true
-    }
-    [[ -n "$ip" ]] && sed -i "/^${ip}$/d" "$CONFIG_DIR/blocked_ips" 2>/dev/null || true
-
-    $PERSISTENT && _save_iptables
-
-    log "unblock: $ip ($mac)"
-    ok "Unblocked: $ip"
+throttle(){
+  require_root; check_deps throttle; [[ -n "$IFACE" ]] || detect_network
+  local mac="$1" speed="$2"
+  is_valid_mac "$mac" || die "Invalid MAC: '$mac'"
+  is_valid_speed "$speed" || die "Invalid speed '$speed'. Examples: 512kbit, 1mbit"
+  [[ "$GATEWAY" != "" ]] || detect_network
+  ip -4 route show dev "$IFACE" proto kernel scope link | grep -qw 'htb' >/dev/null 2>&1 && :
+  $DRY_RUN && { warn "[DRY-RUN] Would configure Netwatch-owned HTB throttle for $mac at $speed on $IFACE."; return 0; }
+  local mark
+  mark=$((16#${mac//:/} % 60000 + 100))
+  if ! tc qdisc show dev "$IFACE" 2>/dev/null | grep -q 'htb'; then
+    die "Refusing to replace the existing root qdisc. Configure a compatible HTB root qdisc first."
+  fi
+  iptables -t mangle -C PREROUTING -m mac --mac-source "${mac^^}" -j MARK --set-mark "$mark" 2>/dev/null || iptables -t mangle -A PREROUTING -m mac --mac-source "${mac^^}" -j MARK --set-mark "$mark" || die 'Failed to add traffic mark.'
+  tc class add dev "$IFACE" parent 1: classid "1:$mark" htb rate "$speed" ceil "$speed" 2>/dev/null || die 'Failed to add HTB class.'
+  tc filter add dev "$IFACE" parent 1: protocol ip prio "$mark" handle "$mark" fw classid "1:$mark" 2>/dev/null || die 'Failed to add HTB filter.'
+  mkdir -p "$CONFIG_DIR" || die 'Cannot create config directory.'
+  grep -Fqi -x -- "$mac" "$THROTTLE_FILE" 2>/dev/null && sed -i -F -x "/${mac}.*/d" "$THROTTLE_FILE" 2>/dev/null || true
+  printf '%s|%s|%s\n' "${mac^^}" "$speed" "$mark" >>"$THROTTLE_FILE"
+  log "throttle: ${mac^^} -> $speed"; ok "Throttled ${mac^^} to $speed."
 }
 
-# ─── Throttle / Unthrottle ────────────────────────────────────────────────────
-
-throttle() {
-    require
-    local mac speed
-    mac=$(normalize_mac "$1")
-    speed="$2"
-
-    is_valid_mac "$mac"     || die "Invalid MAC: '$1'"
-    is_valid_speed "$speed" || die "Invalid speed '$speed'. Examples: 512kbit, 2mbit"
-
-    [[ -z "$IFACE" ]] && detect_network
-
-    local mark
-    mark=$(( 0x$(echo "$mac" | tr -d ':' | tail -c 4) % 65535 + 1 ))
-
-    info "Throttling $mac → $speed (mark $mark) ..."
-    if $DRY_RUN; then
-        warn "[DRY RUN] Would set HTB rate $speed for $mac on $IFACE"
-    else
-        iptables -t mangle -A PREROUTING -m mac --mac-source "$mac" -j MARK --set-mark "$mark" 2>/dev/null || true
-
-        tc qdisc show dev "$IFACE" 2>/dev/null | grep -q "htb" || \
-            tc qdisc add dev "$IFACE" root handle 1: htb default 0 2>/dev/null || true
-
-        tc class  add dev "$IFACE" parent 1: classid "1:$mark" htb rate "$speed" ceil "$speed" 2>/dev/null || true
-        tc filter add dev "$IFACE" parent 1: protocol ip prio "$mark" handle "$mark" fw classid "1:$mark" 2>/dev/null || true
-
-        mkdir -p "$CONFIG_DIR"
-        grep -qi "^$mac|" "$THROTTLE_FILE" 2>/dev/null \
-            && sed -i "/^${mac}|/Id" "$THROTTLE_FILE"
-        echo "$mac|$speed|$mark" >> "$THROTTLE_FILE"
-    fi
-    $PERSISTENT && _save_iptables
-    log "throttle: $mac → $speed"
-    ok "Throttled $mac to $speed"
+unthrottle(){
+  require_root; check_deps unthrottle; [[ -n "$IFACE" ]] || detect_network
+  local mac="${1^^}" entry mark
+  is_valid_mac "$mac" || die "Invalid MAC: '$1'"
+  entry=$(grep -F -i -m1 "^${mac}|" "$THROTTLE_FILE" 2>/dev/null || true)
+  mark=$(awk -F'|' 'NF>=3{print $3; exit}' <<<"$entry")
+  $DRY_RUN && { warn "[DRY-RUN] Would remove Netwatch-owned throttle for $mac."; return 0; }
+  [[ -z "$mark" ]] || tc filter del dev "$IFACE" parent 1: protocol ip prio "$mark" 2>/dev/null || true
+  [[ -z "$mark" ]] || tc class del dev "$IFACE" parent 1: classid "1:$mark" 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -m mac --mac-source "$mac" -j MARK --set-mark "$mark" 2>/dev/null || true
+  [[ -f "$THROTTLE_FILE" ]] && awk -F'|' -v m="$mac" 'toupper($1)!=m' "$THROTTLE_FILE" >"${THROTTLE_FILE}.tmp" && mv -- "${THROTTLE_FILE}.tmp" "$THROTTLE_FILE"
+  log "unthrottle: $mac"; ok "Unthrottled $mac."
 }
 
-unthrottle() {
-    require
-    local mac
-    mac=$(normalize_mac "$1")
-    is_valid_mac "$mac" || die "Invalid MAC: '$1'"
-
-    [[ -z "$IFACE" ]] && detect_network
-
-    local entry mark
-    entry=$(grep -i "^$mac|" "$THROTTLE_FILE" 2>/dev/null | head -1)
-    mark=$(awk -F'|' '{print $3}' <<< "$entry")
-
-    if $DRY_RUN; then
-        warn "[DRY RUN] Would remove throttle rules for $mac"
-    else
-        [[ -n "$mark" ]] && {
-            iptables -t mangle -D PREROUTING -m mac --mac-source "$mac" -j MARK --set-mark "$mark" 2>/dev/null || true
-            tc class  del dev "$IFACE" parent 1: classid "1:$mark" 2>/dev/null || true
-            tc filter del dev "$IFACE" parent 1: protocol ip prio "$mark" 2>/dev/null || true
-        }
-        sed -i "/^${mac}|/Id" "$THROTTLE_FILE" 2>/dev/null || true
-    fi
-    log "unthrottle: $mac"
-    ok "Unthrottled $mac"
+list(){
+  echo -e "\n${BOLD}${RED}Blocked MACs:${NC}"
+  [[ -f "$BLOCK_FILE" && -s "$BLOCK_FILE" ]] && cat -n "$BLOCK_FILE" || echo '  (none)'
+  echo -e "\n${BOLD}${YELLOW}Throttled MACs:${NC}"
+  [[ -f "$THROTTLE_FILE" && -s "$THROTTLE_FILE" ]] || { echo '  (none)'; echo; return 0; }
+  printf '  %-3s %-20s %-10s\n' '#' 'MAC' 'Speed'
+  local i=1 mac speed _
+  while IFS='|' read -r mac speed _; do printf '  %-3s %-20s %-10s\n' "$i" "$mac" "$speed"; ((i++)); done <"$THROTTLE_FILE"
+  echo
 }
 
-# ─── List ─────────────────────────────────────────────────────────────────────
-
-list() {
-    echo -e "\n${BOLD}${RED}Blocked MACs:${NC}"
-    if [[ -f "$BLOCK_FILE" && -s "$BLOCK_FILE" ]]; then
-        cat -n "$BLOCK_FILE"
-    else
-        echo "  (none)"
-    fi
-
-    echo -e "\n${BOLD}${YELLOW}Throttled MACs:${NC}"
-    if [[ -f "$THROTTLE_FILE" && -s "$THROTTLE_FILE" ]]; then
-        printf "  %-3s %-20s %-10s\n" "#" "MAC" "Speed"
-        local i=1
-        while IFS='|' read -r mac speed _; do
-            printf "  %-3s %-20s %-10s\n" "$i" "$mac" "$speed"
-            ((i++))
-        done < "$THROTTLE_FILE"
-    else
-        echo "  (none)"
-    fi
-    echo ""
+export_scan(){
+  local fmt="${1:-csv}"
+  [[ "$fmt" == csv || "$fmt" == json ]] || die 'Export format must be csv or json.'
+  mkdir -p "$CONFIG_DIR" || die 'Cannot create config directory.'
+  detect_network
+  local outfile="$CONFIG_DIR/export_$(date '+%Y%m%d_%H%M%S').$fmt"
+  info "Exporting scan as $fmt -> $outfile"
+  scan "$fmt" >"$outfile" || { rm -f -- "$outfile"; die 'Export failed.'; }
+  ok "Saved to $outfile"
 }
 
-# ─── Export ───────────────────────────────────────────────────────────────────
-
-export_scan() {
-    local fmt="${1:-csv}"
-    local outfile="$CONFIG_DIR/export_$(date '+%Y%m%d_%H%M%S').$fmt"
-    mkdir -p "$CONFIG_DIR"
-    detect_network
-    info "Exporting scan as $fmt → $outfile"
-    scan "$fmt" > "$outfile"
-    ok "Saved to $outfile"
-}
-
-# ─── Identify ─────────────────────────────────────────────────────────────────
-
-identify() {
-    local target="$1"
-    [[ -z "$target" ]] && die "Usage: $SCRIPT_NAME identify <ip|mac>"
-
-    local ip mac
-    if is_valid_mac "$target"; then
-        mac=$(normalize_mac "$target")
-        ip=$(ip neigh show 2>/dev/null | grep -i "$mac" | awk '{print $1}' | head -1)
-        [[ -z "$ip" ]] && die "Cannot find IP for MAC $mac in ARP cache. Run 'scan' first."
-    else
-        ip="$target"
-        mac=$(ip neigh show "$ip" 2>/dev/null | awk 'NR==1 {print $5}')
-    fi
-
-    echo ""
-    echo -e "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "${BOLD}  Device Profile: $ip${NC}"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-
-    echo -e "\n${BOLD}[1/6] Basic Identity${NC}"
-    echo "  IP Address : $ip"
-    echo "  MAC Address: ${mac:---}"
-
-    local rdns
+identify(){
+  local target="$1" pair ip mac rdns oui_vendor nmap_out ports os_guess
+  [[ -n "$target" ]] || die "Usage: $SCRIPT_NAME identify <ip|mac>"
+  detect_network
+  pair=$(resolve_target "$target"); IFS='|' read -r ip mac <<<"$pair"
+  echo -e "\n${BOLD}${CYAN}Device Profile: $ip${NC}"
+  echo "  MAC Address: $mac"
+  rdns=$(getent hosts "$ip" 2>/dev/null | awk 'NR==1{print $2}') || true
+  echo "  rDNS       : ${rdns:-(none)}"
+  oui_vendor='Unknown'
+  [[ "$mac" != -- ]] && oui_vendor=$(vendor "$mac")
+  echo "  Vendor     : $oui_vendor"
+  if command_exists dig && [[ -n "$ip" ]]; then
     rdns=$(dig +short +time=2 -x "$ip" 2>/dev/null | head -1 | sed 's/\.$//')
-    [[ -z "$rdns" ]] && rdns=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}')
-    echo "  rDNS       : ${rdns:-(none)}"
-
-    echo -e "\n${BOLD}[2/6] Hardware Vendor${NC}"
-    local oui_vendor=""
-    if [[ "$mac" != "--" && -n "$mac" ]]; then
-        local oui_query="${mac:0:8}"
-        if command -v curl &>/dev/null; then
-            oui_vendor=$(curl -sf --max-time 3 \
-                "https://api.macvendors.com/${oui_query}" 2>/dev/null || true)
-            [[ "$oui_vendor" == *"errors"* || "$oui_vendor" == *"Not Found"* ]] && oui_vendor=""
-        fi
-        [[ -z "$oui_vendor" ]] && oui_vendor=$(vendor "$mac")
-    fi
-    echo "  OUI Vendor : ${oui_vendor:-(unknown)}"
-
-    echo -e "\n${BOLD}[3/6] mDNS / Bonjour Services${NC}"
-    if command -v avahi-browse &>/dev/null; then
-        local mdns_out
-        mdns_out=$(timeout 5 avahi-browse -a -r -p --no-db-lookup 2>/dev/null \
-            | grep -F "$ip" | awk -F';' '{print $5, $8}' | sort -u)
-        if [[ -n "$mdns_out" ]]; then
-            while read -r svc rest; do
-                echo "  • $svc  →  $rest"
-            done <<< "$mdns_out"
-        else
-            echo "  (no mDNS services detected)"
-        fi
-    else
-        warn "  avahi-browse not found. Install: sudo apt install avahi-utils"
-    fi
-
-    echo -e "\n${BOLD}[4/6] NetBIOS / SMB Name${NC}"
-    if command -v nmblookup &>/dev/null; then
-        local nbt
-        nbt=$(timeout 3 nmblookup -A "$ip" 2>/dev/null \
-            | awk '/<00>/ && !/<GROUP>/ {print $1}' | head -1)
-        echo "  NetBIOS    : ${nbt:-(none)}"
-    else
-        warn "  nmblookup not found. Install: sudo apt install samba-common-bin"
-    fi
-
-    echo -e "\n${BOLD}[5/6] Open Ports & Services${NC}"
-    echo "  (scanning top 1000 ports + version detection, may take ~30s)"
-    local nmap_out
-    nmap_out=$(nmap -sV -O --osscan-guess \
-        --version-intensity 5 \
-        --max-retries 1 \
-        --host-timeout 30s \
-        -T4 "$ip" 2>/dev/null)
-
-    local ports
-    ports=$(echo "$nmap_out" | awk '/^[0-9]+\/tcp/{printf "  %-25s %s %s\n",$1,$3,$NF}')
-    if [[ -n "$ports" ]]; then
-        printf "  %-25s %-10s %s\n" "PORT" "STATE" "SERVICE/VERSION"
-        echo   "  $(printf '─%.0s' {1..55})"
-        echo "$ports"
-    else
-        echo "  (no open TCP ports detected)"
-    fi
-
-    echo -e "\n${BOLD}[6/6] OS Fingerprint${NC}"
-    local os_guess
-    os_guess=$(echo "$nmap_out" | grep -E "^OS:|Running:|OS details:" | head -3 | sed 's/^/  /')
-    echo "${os_guess:-(insufficient data for OS detection)}"
-
-    echo ""
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo -e "  Tip: ${BOLD}netwatch block $mac${NC} to block this device"
-    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-    echo ""
-    log "identify: $ip ($mac)"
+    [[ -n "$rdns" ]] && echo "  rDNS       : $rdns"
+  fi
+  nmap_out=$(nmap -sV -O --osscan-guess --max-retries 1 --host-timeout 30s -T4 "$ip" 2>/dev/null) || true
+  ports=$(printf '%s\n' "$nmap_out" | awk '/^[0-9]+\/tcp/{print "  " $0}')
+  echo -e "\nOpen TCP ports:"
+  [[ -n "$ports" ]] && printf '%s\n' "$ports" || echo '  (none detected)'
+  os_guess=$(printf '%s\n' "$nmap_out" | grep -E '^(Running:|OS details:)' | head -3)
+  echo -e "\nOS hint:"
+  [[ -n "$os_guess" ]] && printf '  %s\n' "$os_guess" || echo '  (insufficient data)'
+  log "identify: $ip ($mac)"
 }
 
-# ─── Reset ────────────────────────────────────────────────────────────────────
-
-reset() {
-    require
-    local iface="${IFACE:-$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')}"
-    warn "This will flush all INPUT/FORWARD iptables rules and TC qdiscs. Continue? [y/N]"
-    read -r yn
-    [[ "${yn,,}" != "y" ]] && { info "Aborted."; return 0; }
-
-    info "Resetting all rules ..."
-    iptables -F INPUT   2>/dev/null || true
-    iptables -F FORWARD 2>/dev/null || true
-    iptables -t mangle -F PREROUTING 2>/dev/null || true
-    tc qdisc del dev "$iface" root 2>/dev/null || true
-    > "$BLOCK_FILE"    2>/dev/null || true
-    > "$THROTTLE_FILE" 2>/dev/null || true
-    log "reset: all rules cleared"
-    ok "All rules cleared."
+reset(){
+  require_root; check_deps reset
+  $DRY_RUN && { warn '[DRY-RUN] Would remove only Netwatch-owned firewall/QoS state.'; return 0; }
+  if command_exists iptables; then
+    while iptables -C FORWARD -j NETWATCH_BLOCK 2>/dev/null; do iptables -D FORWARD -j NETWATCH_BLOCK || break; done
+    if iptables -nL NETWATCH_BLOCK >/dev/null 2>&1; then iptables -F NETWATCH_BLOCK; iptables -X NETWATCH_BLOCK; fi
+    iptables -t mangle -F NETWATCH_QOS 2>/dev/null || true
+    iptables -t mangle -X NETWATCH_QOS 2>/dev/null || true
+  fi
+  if command_exists tc && [[ -n "$IFACE" ]]; then
+    while read -r _ mark _; do [[ "$mark" =~ ^[0-9]+$ ]] || continue; tc filter del dev "$IFACE" parent 1: handle "$mark" fw 2>/dev/null || true; tc class del dev "$IFACE" parent 1: classid "1:$mark" 2>/dev/null || true; done < <(awk -F'|' 'NF>=3{print $1,$3}' "$THROTTLE_FILE" 2>/dev/null || true)
+  fi
+  rm -f -- "$BLOCK_FILE" "$BLOCK_IP_FILE" "$THROTTLE_FILE"
+  log 'reset: Netwatch-owned state cleared'
+  ok 'Netwatch-owned rules and state cleared; unrelated firewall/QoS configuration preserved.'
 }
 
-# ─── Persist iptables ─────────────────────────────────────────────────────────
-
-_save_iptables() {
-    if command -v iptables-save &>/dev/null; then
-        local rules_file="/etc/iptables/rules.v4"
-        mkdir -p "$(dirname "$rules_file")"
-        iptables-save | tee "$rules_file" > /dev/null
-        info "iptables rules saved to $rules_file"
-    else
-        warn "--persistent: iptables-save not found. Install iptables-persistent."
-    fi
+menu(){
+  check_deps menu
+  detect_network
+  local choice interval fmt
+  while true; do
+    clear
+    echo -e "${BOLD}${CYAN}NETWATCH — Linux${NC}"
+    echo "Interface: $IFACE | Subnet: $SUBNET | Gateway: $GATEWAY"
+    echo
+    echo '[1] Scan  [2] Identify  [3] Block  [4] Unblock'
+    echo '[5] Throttle  [6] Unthrottle  [7] List'
+    echo '[8] Monitor  [9] Export  [R] Reset  [U] Update  [Q] Quit'
+    echo
+    read -r -p 'Choice: ' choice || exit 0
+    case "${choice,,}" in
+      1) scan table; read -r -p 'Press Enter...' _ ;;
+      2) read -r -p 'Target IP/MAC: ' target; identify "$target"; read -r -p 'Press Enter...' _ ;;
+      3) read -r -p 'Target IP/MAC: ' target; block "$target"; read -r -p 'Press Enter...' _ ;;
+      4) read -r -p 'Target IP/MAC: ' target; unblock "$target"; read -r -p 'Press Enter...' _ ;;
+      5) read -r -p 'MAC: ' target; read -r -p 'Speed: ' speed; throttle "$target" "$speed"; read -r -p 'Press Enter...' _ ;;
+      6) read -r -p 'MAC: ' target; unthrottle "$target"; read -r -p 'Press Enter...' _ ;;
+      7) list; read -r -p 'Press Enter...' _ ;;
+      8) read -r -p 'Interval [30]: ' interval; [[ -n "$interval" ]] || interval=30; [[ "$interval" =~ ^[1-9][0-9]*$ && "$interval" -le 3600 ]] || { warn 'Interval must be between 1 and 3600 seconds.'; sleep 1; continue; }; while true; do clear; scan table; sleep "$interval"; done ;;
+      9) read -r -p 'Format [csv/json]: ' fmt; [[ -n "$fmt" ]] || fmt=csv; export_scan "$fmt"; read -r -p 'Press Enter...' _ ;;
+      r) reset; read -r -p 'Press Enter...' _ ;;
+      u) check_update; read -r -p 'Press Enter...' _ ;;
+      q) exit 0 ;;
+      *) warn 'Unknown option.'; sleep 1 ;;
+    esac
+  done
 }
-
-# ─── Interactive Menu ─────────────────────────────────────────────────────────
-
-menu() {
-    check_deps
-    detect_network
-    auto_check_update
-
-    # Store scan results for reuse within the session
-    local -a DEVICES=()
-
-    _menu_scan() {
-        info "Scanning network..."
-        DEVICES=()
-        while IFS= read -r line; do
-            DEVICES+=("$line")
-        done < <(scan raw 2>/dev/null)
-    }
-
-    _menu_print_devices() {
-        if [[ ${#DEVICES[@]} -eq 0 ]]; then
-            warn "No devices found. Run a scan first."
-            return 1
-        fi
-        echo ""
-        printf "${BOLD}%-4s %-16s %-18s %-20s %-12s %-10s %-10s${NC}\n" \
-            "#" "IP" "MAC" "Hostname" "Vendor" "Blocked" "Throttled"
-        printf '%s\n' "$(printf '─%.0s' {1..92})"
-        local idx=1
-        for r in "${DEVICES[@]}"; do
-            IFS='|' read -r rip rmac rhost rv rblock rthrottle <<< "$r"
-            local color=""
-            [[ "$rblock" == "BLOCKED" ]] && color="$RED"
-            [[ -n "$rthrottle" && "$rthrottle" != "-" ]] && color="$YELLOW"
-            printf "${color}%-4s %-16s %-18s %-20s %-12s %-10s %-10s${NC}\n" \
-                "$idx" "$rip" "$rmac" "${rhost:0:20}" "${rv:0:12}" "$rblock" "$rthrottle"
-            ((idx++))
-        done
-        echo ""
-    }
-
-    _menu_pick_device() {
-        local prompt="${1:-Select a device}"
-        _menu_print_devices || return 1
-        local choice
-        while true; do
-            read -rp "$(echo -e "${CYAN}$prompt [1-${#DEVICES[@]}] or 0 to cancel: ${NC}")" choice
-            [[ "$choice" == "0" ]] && return 1
-            if [[ "$choice" =~ ^[0-9]+$ ]] && (( choice >= 1 && choice <= ${#DEVICES[@]} )); then
-                SELECTED_DEVICE="${DEVICES[$((choice-1))]}"
-                return 0
-            fi
-            warn "Invalid choice. Enter a number between 1 and ${#DEVICES[@]}."
-        done
-    }
-
-    _menu_header() {
-        clear
-        echo -e "${BOLD}${CYAN}"
-        echo "  ███╗   ██╗███████╗████████╗██╗    ██╗ █████╗ ████████╗ ██████╗██╗  ██╗"
-        echo "  ████╗  ██║██╔════╝╚══██╔══╝██║    ██║██╔══██╗╚══██╔══╝██╔════╝██║  ██║"
-        echo "  ██╔██╗ ██║█████╗     ██║   ██║ █╗ ██║███████║   ██║   ██║     ███████║"
-        echo "  ██║╚██╗██║██╔══╝     ██║   ██║███╗██║██╔══██║   ██║   ██║     ██╔══██║"
-        echo "  ██║ ╚████║███████╗   ██║   ╚███╔███╔╝██║  ██║   ██║   ╚██████╗██║  ██║"
-        echo "  ╚═╝  ╚═══╝╚══════╝   ╚═╝    ╚══╝╚══╝ ╚═╝  ╚═╝   ╚═╝    ╚═════╝╚═╝  ╚═╝"
-        echo -e "${NC}"
-        echo -e "  ${BOLD}Interface:${NC} $IFACE   ${BOLD}Subnet:${NC} $SUBNET   ${BOLD}Gateway:${NC} $GATEWAY"
-        echo -e "  ${BOLD}Devices found:${NC} ${#DEVICES[@]}   ${BOLD}Time:${NC} $(date '+%H:%M:%S')"
-        echo -e "  $(printf '─%.0s' {1..70})"
-        echo ""
-    }
-
-    _menu_main() {
-        while true; do
-            _menu_header
-            echo -e "  ${BOLD}MAIN MENU${NC}"
-            echo ""
-            echo -e "  ${CYAN}[1]${NC} 🔍  Scan network"
-            echo -e "  ${CYAN}[2]${NC} 📋  Show devices"
-            echo -e "  ${CYAN}[3]${NC} 🔎  Identify / probe a device"
-            echo -e "  ${CYAN}[4]${NC} 🚫  Block a device"
-            echo -e "  ${CYAN}[5]${NC} ✅  Unblock a device"
-            echo -e "  ${CYAN}[6]${NC} 🐢  Throttle a device"
-            echo -e "  ${CYAN}[7]${NC} 🚀  Unthrottle a device"
-            echo -e "  ${CYAN}[8]${NC} 📊  Monitor mode"
-            echo -e "  ${CYAN}[9]${NC} 📂  Export scan"
-            echo -e "  ${CYAN}[L]${NC} 📋  List blocked/throttled"
-            echo -e "  ${CYAN}[R]${NC} 🔄  Reset all rules"
-            echo -e "  ${CYAN}[U]${NC} 🔄  Check for updates / Update"
-            echo -e "  ${CYAN}[Q]${NC} 👋  Quit"
-            echo ""
-            read -rp "$(echo -e "  ${BOLD}Choice: ${NC}")" choice
-
-            case "${choice,,}" in
-                1)
-                    _menu_scan
-                    ok "${#DEVICES[@]} device(s) found. Press Enter to continue."
-                    read -r
-                    ;;
-                2)
-                    clear
-                    _menu_print_devices
-                    read -rp "Press Enter to continue..." _
-                    ;;
-                3)
-                    if _menu_pick_device "Select device to identify"; then
-                        IFS='|' read -r rip rmac _ <<< "$SELECTED_DEVICE"
-                        identify "$rip"
-                        read -rp "Press Enter to continue..." _
-                    fi
-                    ;;
-                4)
-                    if [[ "$EUID" -ne 0 ]]; then
-                        warn "Block requires root. Re-run with sudo."
-                        read -rp "Press Enter..." _; continue
-                    fi
-                    if _menu_pick_device "Select device to BLOCK"; then
-                        IFS='|' read -r rip rmac _ <<< "$SELECTED_DEVICE"
-                        local target="${rmac:---}"
-                        [[ "$target" == "--" ]] && target="$rip"
-                        echo -e "${RED}Block $rip ($target)? [y/N]${NC}"
-                        read -r yn
-                        if [[ "${yn,,}" == "y" ]]; then
-                            block "$target"
-                            # Refresh scan to update status
-                            _menu_scan
-                        fi
-                        read -rp "Press Enter to continue..." _
-                    fi
-                    ;;
-                5)
-                    if [[ "$EUID" -ne 0 ]]; then
-                        warn "Unblock requires root. Re-run with sudo."
-                        read -rp "Press Enter..." _; continue
-                    fi
-                    if _menu_pick_device "Select device to UNBLOCK"; then
-                        IFS='|' read -r rip rmac _ <<< "$SELECTED_DEVICE"
-                        local target="${rmac:---}"
-                        [[ "$target" == "--" ]] && target="$rip"
-                        unblock "$target"
-                        _menu_scan
-                        read -rp "Press Enter to continue..." _
-                    fi
-                    ;;
-                6)
-                    if [[ "$EUID" -ne 0 ]]; then
-                        warn "Throttle requires root. Re-run with sudo."
-                        read -rp "Press Enter..." _; continue
-                    fi
-                    if _menu_pick_device "Select device to THROTTLE"; then
-                        IFS='|' read -r rip rmac _ <<< "$SELECTED_DEVICE"
-                        if [[ "$rmac" == "--" || -z "$rmac" ]]; then
-                            warn "Cannot throttle: MAC address unknown for $rip"
-                            read -rp "Press Enter..." _; continue
-                        fi
-                        echo ""
-                        echo -e "  ${BOLD}Speed examples:${NC} 512kbit, 1mbit, 2mbit, 5mbit"
-                        read -rp "$(echo -e "  ${CYAN}Enter speed limit: ${NC}")" speed
-                        if is_valid_speed "$speed"; then
-                            throttle "$rmac" "$speed"
-                            _menu_scan
-                        else
-                            warn "Invalid speed format."
-                        fi
-                        read -rp "Press Enter to continue..." _
-                    fi
-                    ;;
-                7)
-                    if [[ "$EUID" -ne 0 ]]; then
-                        warn "Unthrottle requires root. Re-run with sudo."
-                        read -rp "Press Enter..." _; continue
-                    fi
-                    if _menu_pick_device "Select device to UNTHROTTLE"; then
-                        IFS='|' read -r rip rmac _ <<< "$SELECTED_DEVICE"
-                        if [[ "$rmac" == "--" || -z "$rmac" ]]; then
-                            warn "Cannot unthrottle: MAC address unknown."
-                            read -rp "Press Enter..." _; continue
-                        fi
-                        unthrottle "$rmac"
-                        _menu_scan
-                        read -rp "Press Enter to continue..." _
-                    fi
-                    ;;
-                8)
-                    local interval
-                    read -rp "$(echo -e "  ${CYAN}Refresh interval in seconds [30]: ${NC}")" interval
-                    [[ -z "$interval" ]] && interval=30
-                    monitor "$interval"
-                    ;;
-                9)
-                    echo ""
-                    echo -e "  ${CYAN}[1]${NC} CSV   ${CYAN}[2]${NC} JSON"
-                    read -rp "$(echo -e "  ${CYAN}Format [1]: ${NC}")" fmt_choice
-                    case "$fmt_choice" in
-                        2) export_scan json ;;
-                        *) export_scan csv  ;;
-                    esac
-                    read -rp "Press Enter to continue..." _
-                    ;;
-                l)
-                    clear; list
-                    read -rp "Press Enter to continue..." _
-                    ;;
-                r)
-                    reset
-                    _menu_scan
-                    read -rp "Press Enter to continue..." _
-                    ;;
-                u)
-                    apply_update
-                    read -rp "Press Enter to continue..." _
-                    ;;
-                q)
-                    echo -e "\n${GREEN}Goodbye!${NC}\n"
-                    exit 0
-                    ;;
-                *)
-                    warn "Unknown option. Try again."
-                    sleep 1
-                    ;;
-            esac
-        done
-    }
-
-    # Initial scan on menu launch
-    info "Running initial scan..."
-    _menu_scan
-    _menu_main
-}
-
-# ─── Argument Parsing ─────────────────────────────────────────────────────────
 
 args=()
 for arg in "$@"; do
-    case "$arg" in
-        --dry-run)    DRY_RUN=true ;;
-        --persistent) PERSISTENT=true ;;
-        *)            args+=("$arg") ;;
-    esac
+  case "$arg" in
+    --dry-run) DRY_RUN=true ;;
+    --persistent) PERSISTENT=true ;;
+    *) args+=("$arg") ;;
+  esac
 done
 set -- "${args[@]+"${args[@]}"}"
-
 CMD="${1:-menu}"
 shift || true
 
 case "$CMD" in
-    menu)
-        menu
-        ;;
-    update)
-        apply_update
-        ;;
-    scan)
-        check_deps; detect_network; scan "${1:-table}"
-        ;;
-    monitor)
-        check_deps; detect_network; monitor "${1:-30}"
-        ;;
-    block)
-        [[ -z "$1" ]] && die "Usage: $SCRIPT_NAME block <ip|mac>"
-        check_deps; detect_network; block "$1"
-        ;;
-    unblock)
-        [[ -z "$1" ]] && die "Usage: $SCRIPT_NAME unblock <ip|mac>"
-        check_deps; detect_network; unblock "$1"
-        ;;
-    throttle)
-        [[ -z "$1" || -z "$2" ]] && die "Usage: $SCRIPT_NAME throttle <mac> <speed>"
-        check_deps; detect_network; throttle "$1" "$2"
-        ;;
-    unthrottle)
-        [[ -z "$1" ]] && die "Usage: $SCRIPT_NAME unthrottle <mac>"
-        check_deps; detect_network; unthrottle "$1"
-        ;;
-    list)
-        list
-        ;;
-    identify|info|probe)
-        check_deps; detect_network; identify "$1"
-        ;;
-    export)
-        check_deps; export_scan "${1:-csv}"
-        ;;
-    reset)
-        check_deps; detect_network; reset
-        ;;
-    help|-h|--help)
-        cat <<EOF
+  menu) menu ;;
+  scan) check_deps scan; detect_network; scan "${1:-table}" ;;
+  monitor) check_deps monitor; detect_network; interval="${1:-30}"; [[ "$interval" =~ ^[1-9][0-9]*$ && "$interval" -le 3600 ]] || die 'Interval must be between 1 and 3600 seconds.'; while true; do scan table; sleep "$interval"; done ;;
+  block) check_deps block; detect_network; block "$1" ;;
+  unblock) check_deps unblock; detect_network; unblock "$1" ;;
+  throttle) check_deps throttle; detect_network; throttle "$1" "$2" ;;
+  unthrottle) check_deps unthrottle; detect_network; unthrottle "$1" ;;
+  list) list ;;
+  identify|info|probe) check_deps identify; identify "$1" ;;
+  export) check_deps export; export_scan "${1:-csv}" ;;
+  reset) check_deps reset; detect_network; reset ;;
+  update) check_update || true ;;
+  help|-h|--help)
+    cat <<EOF
+netwatch — Linux network monitor & gateway control
 
-${BOLD}netwatch${NC} — Network monitor & control
+Usage: $SCRIPT_NAME [--dry-run] [--persistent] <command> [args]
 
-${BOLD}Usage:${NC} $SCRIPT_NAME [--dry-run] [--persistent] <command> [args]
+Commands:
+  menu
+  scan [table|json|csv]
+  monitor [1..3600]
+  identify <ip|mac>
+  block <ip|mac>       Gateway/router only
+  unblock <ip|mac>
+  throttle <mac> <speed>
+  unthrottle <mac>
+  list
+  export [csv|json]
+  reset                 Netwatch-owned rules/state only
+  update                Read-only update check
+  help
 
-${BOLD}Commands:${NC}
-  menu                        Interactive menu (default)
-  identify <ip|mac>           Deep fingerprint a device
-  scan [table|json|csv]       Scan local network
-  monitor [interval]          Auto-refresh every N seconds (default: 30)
-  block <ip|mac>              Block a device
-  unblock <ip|mac>            Remove block
-  throttle <mac> <speed>      Limit bandwidth (e.g. 512kbit, 2mbit)
-  unthrottle <mac>            Remove bandwidth limit
-  list                        Show blocked/throttled MACs
-  export [csv|json]           Export scan to $CONFIG_DIR/
-  reset                       Clear all rules
-  update                      Check and apply automatic updates
-  help                        Show this help
-
-${BOLD}Flags:${NC}
-  --dry-run                   Preview without applying changes
-  --persistent                Save iptables rules after block/unblock
-
-${BOLD}Examples:${NC}
-  $SCRIPT_NAME                           # Launch interactive menu
-  $SCRIPT_NAME scan
-  $SCRIPT_NAME block AA:BB:CC:DD:EE:FF
-  $SCRIPT_NAME throttle AA:BB:CC:DD:EE:FF 1mbit
-  $SCRIPT_NAME --dry-run block 192.168.1.50
-
-${BOLD}Config:${NC} $CONFIG_DIR
+Flags:
+  --dry-run
+  --persistent         Compatibility flag; no system-wide persistence file is overwritten.
 EOF
-        ;;
-    *)
-        err "Unknown command: $CMD"
-        echo "Run '$SCRIPT_NAME help' for usage."
-        exit 1
-        ;;
+    ;;
+  *) die "Unknown command: $CMD. Run '$SCRIPT_NAME help'." ;;
 esac
