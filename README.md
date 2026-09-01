@@ -13,7 +13,7 @@ A Bash-based network monitoring and management tool for Linux. Designed for home
 - **Network scanner** — Discover active devices on the detected IPv4 subnet with IP, MAC, hostname, and vendor information.
 - **Device identification** — Inspect a device for reverse DNS, vendor information, open TCP services, and OS hints when privileges permit.
 - **Bandwidth throttling** — Limit a device's bandwidth using Linux Traffic Control (`tc` + `htb`) on a compatible gateway/router setup.
-- **Device blocking** — Block a device using `iptables` in a gateway/router setup.
+- **Device blocking** — Block a device using `iptables` in a gateway/router setup. When `arpspoof` is installed, the Linux gateway block path also uses ARP spoofing against the target and gateway.
 - **Monitor mode** — Auto-refreshing live network view.
 - **Export** — Save scan results as CSV or JSON.
 - **Interactive menu** — Operate netwatch without memorizing CLI syntax.
@@ -32,6 +32,7 @@ Required:
 
 Optional:
 
+- `arpspoof` (`dsniff`) — ARP-based gateway blocking assistance
 - `curl` or `wget` — update checks
 - `ipcalc` — subnet detection helper
 - `dig` — reverse DNS
@@ -41,7 +42,7 @@ Optional:
 Debian/Ubuntu example:
 
 ```bash
-sudo apt install bash nmap iproute2 iptables curl ipcalc dnsutils
+sudo apt install bash nmap iproute2 iptables dsniff curl ipcalc dnsutils
 ```
 
 ## Installation
@@ -74,9 +75,9 @@ netwatch [--dry-run] [--persistent] <command> [args]
 | `scan [table\|json\|csv]` | Scan the detected local subnet |
 | `monitor [interval]` | Auto-refresh every N seconds |
 | `identify <ip\|mac>` | Inspect a device |
-| `block <ip\|mac>` | Block a device |
-| `unblock <ip\|mac>` | Remove a block |
-| `throttle <mac> <speed>` | Limit bandwidth |
+| `block <ip\|mac>` | Block a device from the Linux gateway |
+| `unblock <ip\|mac>` | Remove a block and stop associated ARP spoofing |
+| `throttle <mac> <speed>` | Limit bandwidth from the Linux gateway |
 | `unthrottle <mac>` | Remove a bandwidth limit |
 | `list` | Show blocked/throttled state |
 | `export [csv\|json]` | Export scan results |
@@ -98,6 +99,8 @@ sudo netwatch throttle AA:BB:CC:DD:EE:FF 1mbit
 ## Network model
 
 Netwatch is a Linux network administration utility. Blocking and throttling are gateway/router functions; running the tool on an ordinary client does not make that machine the network gateway.
+
+The scan refreshes stale neighbor entries before reading MAC addresses. The blocking path is restricted to a Linux IPv4 gateway/router and may use `arpspoof` when that tool is installed. `unblock` stops the Netwatch-tracked ARP spoofing processes and restores the gateway's ARP announcement when possible.
 
 Do not use network-control commands on networks or devices you are not authorized to administer.
 
