@@ -1,132 +1,66 @@
 # netwatch 🔍
 
-A Bash-based network monitoring and management tool for Linux. Designed for home lab admins, sysadmins, and anyone who wants visibility and control over their own local network.
+A Bash-based network monitoring and management tool for Linux. Designed for home lab admins, sysadmins, and administrators who need visibility and controlled network operations on systems they own or are authorized to manage.
 
-> **⚠️ Legal Notice:** This tool is intended for use **only on networks you own or have explicit permission to manage**. Unauthorized use on networks you don't control is illegal under computer fraud and network interference laws in most jurisdictions.
-
----
+> **⚠️ Legal notice:** Use netwatch only on networks and systems you own or have explicit permission to administer.
 
 ## Features
 
-- **Network scanner** — Discover all active devices on your subnet with IP, MAC, hostname, and vendor info
-- **Device identification** — Deep-fingerprint a device: open ports, OS guess, mDNS services, NetBIOS name
-- **Bandwidth throttling** — Limit a device's bandwidth using Linux Traffic Control (`tc` + `htb`)
-- **Device blocking** — Block a device from the network via `iptables` (router/gateway mode only)
-- **Monitor mode** — Auto-refreshing live view of your network
-- **Export** — Save scan results as CSV or JSON
-- **Interactive menu** — Full TUI with no flags required; just run `sudo netwatch`
-- **Dry-run mode** — Preview changes before applying with `--dry-run`
-- **Persistent rules** — Optionally save `iptables` rules across reboots with `--persistent`
-
----
+- **Network scanner** — Discover active devices on the detected IPv4 subnet with IP, MAC, hostname, and vendor information.
+- **Device identification** — Inspect a device for reverse DNS, vendor information, open TCP services, and OS hints when privileges permit.
+- **Bandwidth throttling** — Apply Linux Traffic Control (`tc`) rules where the host is an appropriate gateway/router.
+- **Device blocking** — Apply Netwatch-owned `iptables` rules where the host is an IPv4 gateway/router.
+- **Monitor mode** — Repeatedly scan the detected network.
+- **Export** — Save scan results as CSV or JSON.
+- **Interactive menu** — Run the main interface without remembering command syntax.
+- **Dry-run mode** — Preview system-changing operations without applying them.
 
 ## Requirements
 
-| Dependency | Purpose |
-|---|---|
-| `nmap` | Network scanning |
-| `iptables` | Firewall-based device blocking (router mode) |
-| `ip` / `iproute2` | Interface and ARP table management |
-| `tc` (iproute2) | Bandwidth throttling |
-| `awk` | Text processing |
+Required for discovery and inspection:
+
+- `bash`
+- `nmap`
+- `ip` / `iproute2`
+- `awk`
+
+Required only for specific control operations:
+
+- `iptables` — block/unblock/reset
+- `tc` — throttle/unthrottle
 
 Optional:
-- `avahi-utils` — mDNS/Bonjour service discovery in `identify`
-- `samba-common-bin` — NetBIOS name lookup in `identify`
-- `ipcalc` — More accurate subnet detection
-- `dig` — Reverse DNS in `identify`
 
-Install on Debian/Ubuntu:
+- `curl` or `wget` — read-only update checking
+- `dig` — reverse DNS fallback
+- `avahi-utils` — optional mDNS tooling outside the core scan path
+- `samba-common-bin` — optional NetBIOS tooling outside the core scan path
+
+Debian/Ubuntu example:
+
 ```bash
-sudo apt install nmap iproute2 iptables avahi-utils samba-common-bin ipcalc dnsutils
+sudo apt install bash nmap iproute2 iptables curl dnsutils
 ```
-
----
 
 ## Installation
 
 ```bash
-git clone https://github.com/Patrickk2/NETWATCH-carbone..git
-   cd NETWATCH-carbone.
+git clone https://github.com/sudomarc/NETWATCH-carbone.git
+cd NETWATCH-carbone
 chmod +x netwatch.sh
-sudo ./netwatch.sh          # launch interactive menu
+sudo ./netwatch.sh
 ```
 
-Optionally install system-wide:
+Optional system-wide installation:
+
 ```bash
 sudo cp netwatch.sh /usr/local/bin/netwatch
 sudo netwatch
 ```
 
----
-
-## Windows
-
-A PowerShell port, `netwatch.ps1`, ships in this repo with the same CLI and
-interactive menu (`scan`, `monitor`, `identify`, `block`, `unblock`,
-`throttle`, `unthrottle`, `list`, `export`, `reset`, `help`).
-
-```powershell
-git clone https://github.com/Patrickk2/NETWATCH-carbone..git
-cd NETWATCH-carbone.
-Set-ExecutionPolicy -Scope Process Bypass -Force   # allow this script to run
-.\netwatch.ps1                                      # launch interactive menu (Admin recommended)
-```
-
-Requirements: Windows 8 / Server 2012+ (NetTCPIP module, built-in). `nmap`
-(`winget install Insecure.Nmap`) is optional but recommended for faster
-scans + OS fingerprinting in `identify` — without it the script falls back
-to a native ping sweep and a common-port TCP connect scan.
-
-**How blocking/throttling differ from Linux:**
-
-| | Linux (`netwatch.sh`) | Windows (`netwatch.ps1`) |
-|---|---|---|
-| Block | `iptables` FORWARD rules (router mode) + optional ARP spoof kick | Windows Firewall rule — blocks **this machine's** traffic to/from the target |
-| Throttle | `tc`/`htb` on the gateway interface | `New-NetQosPolicy` |
-| LAN-wide kick (non-gateway client) | `arpspoof` (optional dep) | **Not implemented** — needs Npcap + a packet-injection tool, no native Windows equivalent |
-
-Same rule as Linux applies: full network-wide block/throttle of *another*
-device only works when the machine running netwatch **is** the
-gateway/router (e.g. Windows ICS host). On a regular client PC, `block`
-only protects that PC itself.
-
-Config/logs: `%USERPROFILE%\.netwatch\` (override with `NETWATCH_CONFIG`).
-
----
-
-## Android (Termux, no root)
-
-`netwatch-android.sh` runs in [Termux](https://termux.dev) on a stock,
-non-rooted phone. It covers **scan**, **identify**, **monitor**, **export**
-only — `block`/`throttle`/`unblock`/`unthrottle`/`reset` are disabled because
-they need `iptables`/`tc`, which require root.
-
-```bash
-pkg install nmap iproute2 dnsutils curl
-git clone https://github.com/Patrickk2/NETWATCH-carbone..git
-cd NETWATCH-carbone.
-chmod +x netwatch-android.sh
-./netwatch-android.sh
-```
-
-Notes:
-- Host discovery uses `nmap -sn --unprivileged` (ICMP/connect-based — no raw
-  ARP scan without root, but MAC addresses still show up via `ip neigh`
-  reading the kernel's own ARP cache after a successful ping).
-- `identify`'s port scan runs `nmap -sV --unprivileged` (connect scan, no
-  `-O` OS detection — that needs raw sockets/root).
-- No mDNS/NetBIOS lookup (no Termux packages for `avahi-browse`/`nmblookup`).
-- If you root the phone later, use `netwatch.sh` (the Linux version) instead
-  for full block/throttle parity.
-
-Config/logs: `$HOME/.netwatch/` (override with `NETWATCH_CONFIG`).
-
----
-
 ## Usage
 
-```
+```text
 netwatch [--dry-run] [--persistent] <command> [args]
 ```
 
@@ -134,97 +68,90 @@ netwatch [--dry-run] [--persistent] <command> [args]
 
 | Command | Description |
 |---|---|
-| `menu` | Launch interactive TUI (default) |
-| `scan [table\|json\|csv]` | Scan the local subnet |
-| `monitor [interval]` | Auto-refresh every N seconds (default: 30) |
-| `identify <ip\|mac>` | Deep-fingerprint a device |
-| `block <ip\|mac>` | Block a device (requires root + router mode) |
-| `unblock <ip\|mac>` | Remove a block |
-| `throttle <mac> <speed>` | Limit bandwidth (e.g. `512kbit`, `2mbit`) |
-| `unthrottle <mac>` | Remove bandwidth limit |
-| `list` | Show currently blocked/throttled MACs |
-| `export [csv\|json]` | Export scan results to `~/.config/netwatch/` |
-| `reset` | Clear all iptables rules and tc qdiscs |
+| `menu` | Launch the interactive TUI |
+| `scan [table\|json\|csv]` | Scan the detected connected IPv4 subnet |
+| `monitor [interval]` | Re-scan repeatedly; interval is bounded for safety |
+| `identify <ip\|mac>` | Inspect a device |
+| `block <ip\|mac>` | Block a device from a gateway host |
+| `unblock <ip\|mac>` | Remove a Netwatch-owned block |
+| `throttle <mac> <speed>` | Apply a Netwatch-owned bandwidth limit |
+| `unthrottle <mac>` | Remove a Netwatch-owned bandwidth limit |
+| `list` | Show stored Netwatch state |
+| `export [csv\|json]` | Export a scan |
+| `reset` | Remove only Netwatch-owned firewall/QoS state |
+| `update` | Check whether a newer version is available |
 | `help` | Show help |
 
 ### Flags
 
 | Flag | Description |
 |---|---|
-| `--dry-run` | Preview changes without applying them |
-| `--persistent` | Save iptables rules via `iptables-save` after block/unblock |
+| `--dry-run` | Preview system-changing operations without applying them |
+| `--persistent` | Compatibility flag retained for CLI compatibility; does not overwrite system-wide firewall persistence files |
 
 ### Examples
 
 ```bash
-# Interactive menu
-sudo netwatch
-
-# Scan and display devices
 sudo netwatch scan
-
-# Export scan as JSON
 sudo netwatch export json
-
-# Deep-probe a device
 sudo netwatch identify 192.168.1.42
-
-# Limit a device to 1 Mbit/s (your own router only)
-sudo netwatch throttle AA:BB:CC:DD:EE:FF 1mbit
-
-# Remove the throttle
-sudo netwatch unthrottle AA:BB:CC:DD:EE:FF
-
-# Preview a block without applying it
 sudo netwatch --dry-run block 192.168.1.50
-
-# Block and persist rule across reboots
-sudo netwatch --persistent block AA:BB:CC:DD:EE:FF
-
-# Monitor mode, refresh every 10 seconds
+sudo netwatch throttle AA:BB:CC:DD:EE:FF 1mbit
+sudo netwatch unthrottle AA:BB:CC:DD:EE:FF
 sudo netwatch monitor 10
+sudo netwatch update
 ```
 
----
+## Network and control model
 
-## Configuration
+Netwatch uses the Linux kernel routing table to determine the active IPv4 interface, gateway, and connected prefix. It does not invent a `/24` fallback when the connected prefix cannot be determined safely.
 
-All data is stored in `~/.config/netwatch/` (override with `NETWATCH_CONFIG` env var):
+`block` is gateway/router-only. The current implementation does not perform ARP spoofing. Blocking another LAN device from an ordinary client machine is refused.
 
-| File | Contents |
+`throttle` uses Linux `tc` and Netwatch-owned firewall marks/classes. Netwatch must not replace an unrelated root qdisc or silently claim that a failed QoS operation succeeded.
+
+`reset` removes only Netwatch-owned state. It must not flush the machine's global `INPUT`, `FORWARD`, or `PREROUTING` chains and must not delete unrelated QoS configuration.
+
+## Update model
+
+The updater performs a **read-only version check**. It does not automatically download, replace, or execute a remote script.
+
+A detected update should be reviewed and installed from a trusted Git commit or tag rather than treating an unsigned raw HTTP payload as authenticated executable code.
+
+## Configuration and state
+
+Default state directory:
+
+```text
+~/.config/netwatch/
+```
+
+Override it with `NETWATCH_CONFIG`.
+
+Typical files:
+
+| File | Purpose |
 |---|---|
-| `blocked_macs` | MACs currently blocked |
-| `throttled_macs` | MACs with active bandwidth limits |
-| `scan_history.log` | Timestamped log of all actions |
-| `export_*.csv/json` | Exported scan results |
+| `blocked_macs` | Stored blocked MAC addresses |
+| `blocked_ips` | Stored blocked IPv4 addresses |
+| `throttled_macs` | Stored throttle entries |
+| `scan_history.log` | Timestamped activity log |
+| `export_*.csv/json` | Generated scan exports |
 
----
+Runtime state should not be committed to the repository.
 
-## How blocking and throttling work
+## Vendor information
 
-**Blocking** uses `iptables` `FORWARD` rules and only has effect when the machine running `netwatch` is the network gateway (i.e. `net.ipv4.ip_forward=1`). It drops forwarded traffic to/from the target IP and MAC. It will not work if run from a regular LAN client that is not the router.
+Vendor names are OUI-based guesses and are intentionally incomplete. A displayed vendor must not be interpreted as authoritative hardware identity.
 
-**Throttling** uses Linux Traffic Control (`tc`) with an HTB qdisc. It marks packets from a target MAC using `iptables mangle` and shapes them to the specified rate. This also requires running on the gateway interface.
+## Security
 
----
-
-## Scan output fields
-
-| Field | Description |
-|---|---|
-| IP | Device IP address |
-| MAC | Hardware address (from ARP cache) |
-| Hostname | Reverse DNS / mDNS name |
-| Vendor | OUI-based hardware vendor guess |
-| Blocked | `BLOCKED` if an active rule exists |
-| Throttled | Active speed limit, if any |
-
----
+Netwatch is a privileged network administration tool. Validate targets before control operations, use `--dry-run` before destructive changes, and operate only on authorized networks.
 
 ## License
 
-MIT — see [LICENSE](LICENSE)
+MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-PRs welcome. See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md).
