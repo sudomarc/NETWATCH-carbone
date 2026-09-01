@@ -11,9 +11,9 @@ A Bash-based network monitoring and management tool for Linux. Designed for home
 ## Features
 
 - **Network scanner** — Discover active devices on the detected IPv4 subnet with IP, MAC, hostname, and vendor information.
-- **Device identification** — Inspect a device for reverse DNS, vendor information, open TCP services, and OS hints when privileges permit.
+- **Device identification** — Inspect reverse DNS, hardware vendor, mDNS/Bonjour services, NetBIOS/SMB name, open TCP services, service versions, and OS fingerprinting when available.
 - **Bandwidth throttling** — Limit a device's bandwidth using Linux Traffic Control (`tc` + `htb`) on a compatible gateway/router setup.
-- **Device blocking** — Block a device using `iptables` in a gateway/router setup. When `arpspoof` is installed, the Linux gateway block path also uses ARP spoofing against the target and gateway.
+- **Device blocking** — Block a device using `iptables` on a Linux IPv4 gateway/router and optionally use `arpspoof` when installed.
 - **Monitor mode** — Auto-refreshing live network view.
 - **Export** — Save scan results as CSV or JSON.
 - **Interactive menu** — Operate netwatch without memorizing CLI syntax.
@@ -54,13 +54,6 @@ chmod +x netwatch.sh
 sudo ./netwatch.sh
 ```
 
-Optional system-wide installation:
-
-```bash
-sudo cp netwatch.sh /usr/local/bin/netwatch
-sudo netwatch
-```
-
 ## Usage
 
 ```text
@@ -72,37 +65,24 @@ netwatch [--dry-run] [--persistent] <command> [args]
 | Command | Description |
 |---|---|
 | `menu` | Launch interactive TUI |
-| `scan [table\|json\|csv]` | Scan the detected local subnet |
+| `scan [table|json|csv]` | Scan the detected local IPv4 subnet |
 | `monitor [interval]` | Auto-refresh every N seconds |
-| `identify <ip\|mac>` | Inspect a device |
-| `block <ip\|mac>` | Block a device from the Linux gateway |
-| `unblock <ip\|mac>` | Remove a block and stop associated ARP spoofing |
+| `identify <ip|mac>` | Deep device identification, services, and OS fingerprinting |
+| `block <ip|mac>` | Block a device from a Linux IPv4 gateway/router; may use ARP spoofing |
+| `unblock <ip|mac>` | Remove a block and stop associated ARP spoofing |
 | `throttle <mac> <speed>` | Limit bandwidth from the Linux gateway |
 | `unthrottle <mac>` | Remove a bandwidth limit |
 | `list` | Show blocked/throttled state |
-| `export [csv\|json]` | Export scan results |
-| `reset` | Clear Netwatch control state |
-| `update` | Check for a newer version |
+| `export [csv|json]` | Export scan results |
+| `reset` | Clear firewall/QoS rules and local Netwatch state |
+| `update` | Check for a newer version and apply the available update |
 | `help` | Show help |
-
-### Examples
-
-```bash
-sudo netwatch scan
-sudo netwatch identify 192.168.1.42
-sudo netwatch export json
-sudo netwatch monitor 10
-sudo netwatch --dry-run block 192.168.1.50
-sudo netwatch throttle AA:BB:CC:DD:EE:FF 1mbit
-```
 
 ## Network model
 
-Netwatch is a Linux network administration utility. Blocking and throttling are gateway/router functions; running the tool on an ordinary client does not make that machine the network gateway.
+Netwatch is a Linux network administration utility. Blocking and throttling are gateway/router operations. The host must be appropriately positioned in the traffic path, and IPv4 forwarding is required for gateway blocking.
 
-The scan refreshes stale neighbor entries before reading MAC addresses. The blocking path is restricted to a Linux IPv4 gateway/router and may use `arpspoof` when that tool is installed. `unblock` stops the Netwatch-tracked ARP spoofing processes and restores the gateway's ARP announcement when possible.
-
-Do not use network-control commands on networks or devices you are not authorized to administer.
+The scan refreshes stale neighbor entries before MAC lookup. Device identification uses Nmap service/version detection and OS fingerprinting, with optional local discovery helpers. Vendor information is best-effort based on the built-in OUI table and optional online lookup.
 
 ## Configuration
 
@@ -117,15 +97,11 @@ Override it with `NETWATCH_CONFIG`.
 Typical files include:
 
 - `blocked_macs`
+- `blocked_ips`
 - `throttled_macs`
 - `scan_history.log`
-- generated `export_*.csv` / `export_*.json`
-
-Runtime state is excluded from version control.
-
-## Vendor information
-
-Vendor information is based on a limited OUI mapping and should be treated as a best-effort guess, not authoritative hardware identification.
+- generated exports
+- Netwatch ARP-spoof PID files
 
 ## License
 
@@ -133,4 +109,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-This is a Linux-only Bash project. See [CONTRIBUTING.md](CONTRIBUTING.md).
+This is a Linux-only Bash project. Do not add Android, Termux, Windows, or PowerShell implementations.
