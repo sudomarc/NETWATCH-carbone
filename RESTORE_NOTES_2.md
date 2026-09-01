@@ -1,1 +1,0 @@
-Linux capability restoration branch. The Linux implementation restores the historical scan, identification, throttling, reset, and gateway ARP-spoof behaviors while Android/Windows remain removed.
