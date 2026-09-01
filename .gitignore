@@ -6,7 +6,9 @@ export_*.csv
 export_*.json
 blocked_macs
 blocked_ips
+blocked_ipv6
 throttled_macs
+arp_*.pid
 .last_update_check
 
 # OS/editor clutter
