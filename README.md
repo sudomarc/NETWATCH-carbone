@@ -4,42 +4,44 @@ A Bash-based network monitoring and management tool for Linux. Designed for home
 
 > **⚠️ Legal notice:** Use netwatch only on networks and systems you own or have explicit permission to administer.
 
+## Platform
+
+**Linux only.** Android/Termux and Windows/PowerShell are not supported by this repository.
+
 ## Features
 
 - **Network scanner** — Discover active devices on the detected IPv4 subnet with IP, MAC, hostname, and vendor information.
 - **Device identification** — Inspect a device for reverse DNS, vendor information, open TCP services, and OS hints when privileges permit.
-- **Bandwidth throttling** — Apply Linux Traffic Control (`tc`) rules where the host is an appropriate gateway/router.
-- **Device blocking** — Apply Netwatch-owned `iptables` rules where the host is an IPv4 gateway/router.
-- **Monitor mode** — Repeatedly scan the detected network.
+- **Bandwidth throttling** — Limit a device's bandwidth using Linux Traffic Control (`tc` + `htb`) on a compatible gateway/router setup.
+- **Device blocking** — Block a device using `iptables` in a gateway/router setup.
+- **Monitor mode** — Auto-refreshing live network view.
 - **Export** — Save scan results as CSV or JSON.
-- **Interactive menu** — Run the main interface without remembering command syntax.
-- **Dry-run mode** — Preview system-changing operations without applying them.
+- **Interactive menu** — Operate netwatch without memorizing CLI syntax.
+- **Dry-run mode** — Preview changes before applying them.
 
 ## Requirements
 
-Required for discovery and inspection:
+Required:
 
-- `bash`
+- Bash
 - `nmap`
 - `ip` / `iproute2`
+- `iptables`
+- `tc` / `iproute2`
 - `awk`
-
-Required only for specific control operations:
-
-- `iptables` — block/unblock/reset
-- `tc` — throttle/unthrottle
 
 Optional:
 
-- `curl` or `wget` — read-only update checking
-- `dig` — reverse DNS fallback
-- `avahi-utils` — optional mDNS tooling outside the core scan path
-- `samba-common-bin` — optional NetBIOS tooling outside the core scan path
+- `curl` or `wget` — update checks
+- `ipcalc` — subnet detection helper
+- `dig` — reverse DNS
+- `avahi-utils` — optional mDNS tooling
+- `samba-common-bin` — optional NetBIOS tooling
 
 Debian/Ubuntu example:
 
 ```bash
-sudo apt install bash nmap iproute2 iptables curl dnsutils
+sudo apt install bash nmap iproute2 iptables curl ipcalc dnsutils
 ```
 
 ## Installation
@@ -68,59 +70,40 @@ netwatch [--dry-run] [--persistent] <command> [args]
 
 | Command | Description |
 |---|---|
-| `menu` | Launch the interactive TUI |
-| `scan [table\|json\|csv]` | Scan the detected connected IPv4 subnet |
-| `monitor [interval]` | Re-scan repeatedly; interval is bounded for safety |
+| `menu` | Launch interactive TUI |
+| `scan [table\|json\|csv]` | Scan the detected local subnet |
+| `monitor [interval]` | Auto-refresh every N seconds |
 | `identify <ip\|mac>` | Inspect a device |
-| `block <ip\|mac>` | Block a device from a gateway host |
-| `unblock <ip\|mac>` | Remove a Netwatch-owned block |
-| `throttle <mac> <speed>` | Apply a Netwatch-owned bandwidth limit |
-| `unthrottle <mac>` | Remove a Netwatch-owned bandwidth limit |
-| `list` | Show stored Netwatch state |
-| `export [csv\|json]` | Export a scan |
-| `reset` | Remove only Netwatch-owned firewall/QoS state |
-| `update` | Check whether a newer version is available |
+| `block <ip\|mac>` | Block a device |
+| `unblock <ip\|mac>` | Remove a block |
+| `throttle <mac> <speed>` | Limit bandwidth |
+| `unthrottle <mac>` | Remove a bandwidth limit |
+| `list` | Show blocked/throttled state |
+| `export [csv\|json]` | Export scan results |
+| `reset` | Clear Netwatch control state |
+| `update` | Check for a newer version |
 | `help` | Show help |
-
-### Flags
-
-| Flag | Description |
-|---|---|
-| `--dry-run` | Preview system-changing operations without applying them |
-| `--persistent` | Compatibility flag retained for CLI compatibility; does not overwrite system-wide firewall persistence files |
 
 ### Examples
 
 ```bash
 sudo netwatch scan
-sudo netwatch export json
 sudo netwatch identify 192.168.1.42
+sudo netwatch export json
+sudo netwatch monitor 10
 sudo netwatch --dry-run block 192.168.1.50
 sudo netwatch throttle AA:BB:CC:DD:EE:FF 1mbit
-sudo netwatch unthrottle AA:BB:CC:DD:EE:FF
-sudo netwatch monitor 10
-sudo netwatch update
 ```
 
-## Network and control model
+## Network model
 
-Netwatch uses the Linux kernel routing table to determine the active IPv4 interface, gateway, and connected prefix. It does not invent a `/24` fallback when the connected prefix cannot be determined safely.
+Netwatch is a Linux network administration utility. Blocking and throttling are gateway/router functions; running the tool on an ordinary client does not make that machine the network gateway.
 
-`block` is gateway/router-only. The current implementation does not perform ARP spoofing. Blocking another LAN device from an ordinary client machine is refused.
+Do not use network-control commands on networks or devices you are not authorized to administer.
 
-`throttle` uses Linux `tc` and Netwatch-owned firewall marks/classes. Netwatch must not replace an unrelated root qdisc or silently claim that a failed QoS operation succeeded.
+## Configuration
 
-`reset` removes only Netwatch-owned state. It must not flush the machine's global `INPUT`, `FORWARD`, or `PREROUTING` chains and must not delete unrelated QoS configuration.
-
-## Update model
-
-The updater performs a **read-only version check**. It does not automatically download, replace, or execute a remote script.
-
-A detected update should be reviewed and installed from a trusted Git commit or tag rather than treating an unsigned raw HTTP payload as authenticated executable code.
-
-## Configuration and state
-
-Default state directory:
+Default configuration directory:
 
 ```text
 ~/.config/netwatch/
@@ -128,25 +111,18 @@ Default state directory:
 
 Override it with `NETWATCH_CONFIG`.
 
-Typical files:
+Typical files include:
 
-| File | Purpose |
-|---|---|
-| `blocked_macs` | Stored blocked MAC addresses |
-| `blocked_ips` | Stored blocked IPv4 addresses |
-| `throttled_macs` | Stored throttle entries |
-| `scan_history.log` | Timestamped activity log |
-| `export_*.csv/json` | Generated scan exports |
+- `blocked_macs`
+- `throttled_macs`
+- `scan_history.log`
+- generated `export_*.csv` / `export_*.json`
 
-Runtime state should not be committed to the repository.
+Runtime state is excluded from version control.
 
 ## Vendor information
 
-Vendor names are OUI-based guesses and are intentionally incomplete. A displayed vendor must not be interpreted as authoritative hardware identity.
-
-## Security
-
-Netwatch is a privileged network administration tool. Validate targets before control operations, use `--dry-run` before destructive changes, and operate only on authorized networks.
+Vendor information is based on a limited OUI mapping and should be treated as a best-effort guess, not authoritative hardware identification.
 
 ## License
 
@@ -154,4 +130,4 @@ MIT — see [LICENSE](LICENSE).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+This is a Linux-only Bash project. See [CONTRIBUTING.md](CONTRIBUTING.md).
