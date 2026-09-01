@@ -1,0 +1,16 @@
+# Runtime state and local network data
+.config/
+*.log
+*.tmp
+export_*.csv
+export_*.json
+blocked_macs
+blocked_ips
+throttled_macs
+.last_update_check
+
+# OS/editor clutter
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
