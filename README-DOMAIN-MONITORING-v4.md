@@ -1,0 +1,1 @@
+Domain monitoring is implemented in `netwatch-domains.sh` on `feat/domain-monitoring`.
