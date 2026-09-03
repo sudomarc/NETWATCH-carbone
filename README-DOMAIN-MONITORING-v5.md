@@ -1,0 +1,1 @@
+Staged domain observer: `netwatch-domains.sh`.
