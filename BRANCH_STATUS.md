@@ -1,0 +1,1 @@
+Feature branch `feat/domain-monitoring` adds passive conventional-DNS domain observation. This is a staging branch; no core behavior is changed yet.
